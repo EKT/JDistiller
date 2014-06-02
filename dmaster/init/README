@@ -1,0 +1,3 @@
+create user jdistiller with uid 1000:    useradd jdistiller -u 1000
+copy .bashrc to /home/jdistiller
+copy jdistiller to /etc/init.d/

@@ -1,0 +1,320 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import sqlite3
+import uuid
+import datetime
+import threading
+import time
+import optparse
+import os
+import os.path
+import sys
+import signal
+from daemon import runner
+import logging
+import socket
+import math
+from datetime import datetime
+# jdistiller Modules
+from dutils import ColorAttr,States,DistillerLogger
+
+version = """j2pk-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  ping      ping host
+  enable    enable worker host from cluster
+  disable   disable worker host from cluster
+  delete    delete worker node from cluster
+  status    return dPool cluster status
+  queuesize return host queue's size
+  stats     return host statistics
+
+Example session:
+  %prog ping host      # ping cluster host
+  %prog enable host    # enable cluster host
+  %prog disable host   # disable cluster host
+  %prog delete host    # delete cluster host
+  %prog status         # print cluster's status
+  %prog queuesize host # print host queue's size
+  %prog stats host     # print host statistics
+  """
+
+# Local Master Database 
+MASTER_DATABASE = os.getcwd()+'/distiller_master.db'
+
+class DistillerAdmin(object):
+	def __init__(self):
+		pass
+
+	def ping_host(self,hostname):
+		try:
+			ipaddr = socket.gethostbyname(hostname)
+			print "PING %s (%s)" % (hostname,socket.gethostbyname(hostname))
+		except:
+			print "ping: unknown host %s" % hostname
+			sys.exit(-1)
+		try:
+			self.context = zmq.Context()
+			self.status = self.context.socket(zmq.REQ)
+			self.status.setsockopt(zmq.LINGER,0)
+			self.status.connect("tcp://"+hostname+":5002")
+			self.status.send("MASTER_GET_STATUS")
+			self.poller = zmq.Poller()
+			self.poller.register(self.status,zmq.POLLIN)
+			if self.poller.poll(1000):
+				msg = self.status.recv_json()
+				if msg:
+					if msg["WORKER"] == States.D_RUNNING: 
+						print "Worker Service: %s" %  (ColorAttr.D_GREEN+msg["WORKER"]+ColorAttr.D_ENDC)
+					if msg["WORKER"] == States.D_DOWN: 
+						print "Worker Service: %s" %  (ColorAttr.D_WARNING+msg["WORKER"]+ColorAttr.D_ENDC)
+					if msg["QUEUE"] == States.D_RUNNING: 
+						print "Queue Service: %s" %  (ColorAttr.D_GREEN+msg["QUEUE"]+ColorAttr.D_ENDC)
+					if msg["QUEUE"] == States.D_DOWN: 
+						print "Queue Service: %s" %  (ColorAttr.D_WARNING+msg["QUEUE"]+ColorAttr.D_ENDC)
+					if msg["CONVERTER"] == States.D_RUNNING: 
+						print "Converter Service: %s" %  (ColorAttr.D_GREEN+msg["CONVERTER"]+ColorAttr.D_ENDC)
+					if msg["CONVERTER"] == States.D_DOWN: 
+						print "Converter Service: %s" %  (ColorAttr.D_WARNING+msg["CONVERTER"]+ColorAttr.D_ENDC)
+					if msg["REPOSITORIES"] == States.D_OK: 
+						print "Repositories: %s" %  (ColorAttr.D_GREEN+"Mounted"+ColorAttr.D_ENDC)
+					if msg["REPOSITORIES"] == States.D_NOK: 
+						print "Repositories: %s" %  (ColorAttr.D_FAIL+"Unmounted"+ColorAttr.D_ENDC)
+			else:
+				print ColorAttr.D_FAIL+"Worker does not respond."+ColorAttr.D_ENDC
+			self.status.close()
+			self.context.destroy()
+		except Exception,e:
+			print "ZMQ error in ping_host"
+			print e
+	
+	def print_global_status(self):
+		try:
+			conn = sqlite3.connect(MASTER_DATABASE)
+			cursor = conn.cursor()
+			query = "SELECT * FROM active_nodes ORDER BY hostname ASC"
+			active_nodes = []
+			for uuid,hostname in cursor.execute(query):
+				active_nodes.append(hostname)
+			query = "SELECT * FROM nodes ORDER BY hostname ASC"
+			node_data = []
+			hostnames = {}
+			for uuid,hostname,service,regtime,role in cursor.execute(query):
+				hostnames[hostname] = uuid
+				node_data.append([uuid,hostname,service,regtime])
+		        
+			print ColorAttr.D_BLUE+"Hostname",	
+			print "%20s %34s %26s %0s" %("Service","Registration","Uptime",ColorAttr.D_ENDC)
+			print ColorAttr.D_BLUE+"-"*91+ColorAttr.D_ENDC
+			for hostname,uuid in hostnames.items():
+				print hostname+" (UUID: "+uuid+")"
+				for uuid,host,service,time in node_data:
+					if hostname == host and host in active_nodes:
+						print "%29s %34s" % (service,time),
+						print "%26s" % str(datetime.now()-datetime.strptime(time,'%Y-%m-%d %H:%M:%S.%f'))
+					elif hostname == host and host not in active_nodes:
+						print "%29s %34s" % (service,time),
+						print "%26s" % " " 
+				print ""
+				
+			query = "SELECT * FROM active_nodes ORDER BY hostname ASC"
+			print ""
+			print ColorAttr.D_BLUE+"Active Nodes"+ColorAttr.D_ENDC
+			print ColorAttr.D_BLUE+"------------"+ColorAttr.D_ENDC
+			for uuid,hostname in cursor.execute(query):
+				print hostname
+			query = "SELECT * FROM busy_nodes ORDER BY hostname ASC"
+			print ""
+			print ColorAttr.D_BLUE+"Busy Nodes"+ColorAttr.D_ENDC
+			print ColorAttr.D_BLUE+"----------"+ColorAttr.D_ENDC
+			for uuid,hostname in cursor.execute(query):
+				print hostname
+			query = "SELECT * FROM nonbusy_nodes ORDER BY hostname ASC"
+			print ""
+			print ColorAttr.D_BLUE+"NonBusy Nodes"+ColorAttr.D_ENDC
+			print ColorAttr.D_BLUE+"-------------"+ColorAttr.D_ENDC
+			for uuid,hostname in cursor.execute(query):
+				print hostname
+			print ""
+				
+		except sqlite3.Error, e:
+			print "Error %s:" % e.args[0]
+		finally:
+			if conn:
+				conn.close()
+	
+	def get_queues(self,hostname):
+		try:
+			ipaddr = socket.gethostbyname(hostname)
+			print "PING %s (%s)" % (hostname,socket.gethostbyname(hostname))
+		except:
+			print "ping: unknown host %s" % hostname
+			sys.exit(-1)
+		try:
+			self.context = zmq.Context()
+			self.status = self.context.socket(zmq.REQ)
+			self.status.setsockopt(zmq.LINGER,0)
+			self.status.connect("tcp://"+hostname+":5002")
+			self.status.send("GET_QUEUES_SIZE")
+			self.poller = zmq.Poller()
+			self.poller.register(self.status,zmq.POLLIN)
+			if self.poller.poll(1000):
+				msg = self.status.recv_json()
+				if msg:
+					print ColorAttr.D_YELLOW+"Png Queue Size: "+str(msg["PNGQUEUE"])+ColorAttr.D_ENDC
+					print ColorAttr.D_YELLOW+"Jp2 Queue Size: "+str(msg["JP2QUEUE"])+ColorAttr.D_ENDC
+		except Exception,e:
+			print "Error while trying to retrieve Queues Size for %s" % hostname
+			print e
+
+	def bytes2human(self,n):
+	    """
+	    >>> bytes2human(10000)
+	    '9K'
+	    >>> bytes2human(100001221)
+	    '95M'
+	    """
+	    symbols = ('KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB')
+	    prefix = {}
+	    for i, s in enumerate(symbols):
+	        prefix[s] = 1 << (i+1)*10
+	    for s in reversed(symbols):
+	        if n >= prefix[s]:
+	            value = int(float(n) / prefix[s])
+	            value = round(float(n) / (prefix[s]),2)
+	            return '%s%s' % (value, s)
+	    return "%sB" % n	
+
+	def print_color(self,text,color):
+		print color+str(text)+ColorAttr.D_ENDC
+	
+	def get_stats(self,hostname):
+		try:
+			ipaddr = socket.gethostbyname(hostname)
+			print "STATS %s (%s)" % (hostname,socket.gethostbyname(hostname))
+		except:
+			print "stats: unknown host %s" % hostname
+			sys.exit(-1)
+		try:
+			self.context = zmq.Context()
+			self.status = self.context.socket(zmq.REQ)
+			self.status.setsockopt(zmq.LINGER,0)
+			self.status.connect("tcp://"+hostname+":5002")
+			self.status.send("GET_NODE_STATS")
+			self.poller = zmq.Poller()
+			self.poller.register(self.status,zmq.POLLIN)
+			if self.poller.poll(3000):
+				msg = self.status.recv_json()
+				if msg:
+					#print "CPU No: %s" % msg['NUM_CPUS']
+					self.print_color("* Load Average (per CPU)",ColorAttr.D_YELLOW)
+					self.print_color(" %s" % msg['CPU_PERCENT'],ColorAttr.D_BLUE)
+					g = lambda x: msg['PHYMEM_USAGE'][x]
+					self.print_color("* Physical Memory Usage",ColorAttr.D_YELLOW)
+					self.print_color(" Total: %s Used: %s Free: %s Percent: %s " % (self.bytes2human(g(0)),self.bytes2human(g(1)),self.bytes2human(g(2)),g(3)),ColorAttr.D_BLUE)
+					g = lambda x: msg['VIRTMEM_USAGE'][x]
+					self.print_color("* Virtual Memory Usage",ColorAttr.D_YELLOW)
+					self.print_color(" Total: %s Used: %s Free: %s Percent: %s " % (self.bytes2human(g(0)),self.bytes2human(g(1)),self.bytes2human(g(2)),g(3)),ColorAttr.D_BLUE)
+					#print "Disk Partitions\n %s" % msg['DISK_PARTITIONS']
+					g = lambda x: msg['DISK_USAGE'][x]
+					self.print_color("* Disk Usage",ColorAttr.D_YELLOW)
+					self.print_color(" Total: %s Used: %s Free: %s Percent: %s " % (self.bytes2human(g(0)),self.bytes2human(g(1)),self.bytes2human(g(2)),g(3)),ColorAttr.D_BLUE)
+					g = lambda x: msg['DISK_IO_COUNTERS'][x]
+					self.print_color("* Disk I/O Counters",ColorAttr.D_YELLOW)
+					self.print_color(" Read Bytes: %s Write Bytes: %s" % (self.bytes2human(g(2)),self.bytes2human(g(3))),ColorAttr.D_BLUE)
+					self.print_color("* Network I/O Counters",ColorAttr.D_YELLOW)
+					for key,value in msg['NETWORK_IO_COUNTERS'].iteritems():
+						self.print_color(" Interface %s: TX Bytes: %s RX Bytes: %s" % (key.split(':')[0], self.bytes2human(value[0]), self.bytes2human(value[1])),ColorAttr.D_BLUE)
+					for repo in msg["REPOSITORY_LIST"]:
+						g = lambda x: msg[repo][x]
+						self.print_color("* Repository '"+repo+"' Disk Usage",ColorAttr.D_YELLOW)
+						self.print_color(" Total: %s Used: %s Free: %s Percent: %s " % (self.bytes2human(g(0)),self.bytes2human(g(1)),self.bytes2human(g(2)),g(3)),ColorAttr.D_BLUE)
+			else:
+				print ColorAttr.D_FAIL+"Worker does not respond."+ColorAttr.D_ENDC
+		except Exception,e:
+			print "Error while trying to retrieve Node statistics for %s" % hostname
+			print e
+			
+
+
+if __name__ == "__main__":
+
+	optparser = optparse.OptionParser(usage=usage,version=version)
+	(options, args) = optparser.parse_args()
+
+	if len(args) == 0:
+	        optparser.print_help()
+	        sys.exit(-1)
+
+	if args[0] == 'ping':
+		if len(args)==2:
+			admin = DistillerAdmin()
+			admin.ping_host(args[1])
+		else:
+	        	optparser.print_help()
+		        sys.exit(-1)
+	elif args[0] == 'queuesize':
+		if len(args) ==2:
+			admin = DistillerAdmin().get_queues(args[1])
+		else:
+			optparser.print_help()
+			sys.exit(-1)
+	elif args[0] == 'stats':
+		if len(args) ==2:
+			admin = DistillerAdmin().get_stats(args[1])
+		else:
+			optparser.print_help()
+			sys.exit(-1)
+	elif args[0] == 'status':
+		if len(args) == 2:
+			try:
+				if int(args[1]) < 1:
+					print "Please give time delay in seconds. Value must be larger than 0"
+					sys.exit(-1)			
+			except ValueError:
+				print "Please give time delay in seconds. Value must be larger than 0"
+				sys.exit(-1)			
+			delay = int(args[1])
+			while True:
+				try:
+					os.system('clear')
+					admin = DistillerAdmin()
+					admin.print_global_status()
+					print ColorAttr.D_UYELLOW+str(datetime.now()).split('.')[0]+ColorAttr.D_ENDC
+					time.sleep(delay)
+				except KeyboardInterrupt:
+					ColorAttr().print_color_r("Exiting...",ColorAttr.D_FAIL)
+					break
+				except ValueError:
+					print "Please give time delay in seconds. Value must be larger than 0"
+					break
+		else:
+			admin = DistillerAdmin()
+			admin.print_global_status()
+	else:
+	        optparser.print_help()
+	        sys.exit(-1)

@@ -1,0 +1,422 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import sqlite3
+import uuid
+import datetime
+import threading
+import time
+import optparse
+import os
+import os.path
+import sys
+import signal
+from daemon import runner
+import platform
+import logging
+import setproctitle
+import ConfigParser
+# jp2k-distiller Modules
+from dutils import ColorAttr,States,Services,DistillerLogger,DistillerTailLog
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log       watch server's logfile (enable DEBUG mode)
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log       # watch daemon's logfile (enable DEBUG mode)
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+
+
+DEBUG_ = True
+SERVICE_NAME = "distiller-master"
+_conffile='distiller_master.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+MASTER_SERVER_ENDPOINT=config.get("MASTER","MasterServerEndpoint")
+MASTER_DATABASE=os.getcwd()+'/distiller_master.db'
+MASTER_PID_FILE=config.get("MASTER","MasterPIDFile")
+MASTER_LOG_FILE=config.get("MASTER","MasterLogFile")
+
+Active_Nodes = {}
+Nodes_Status = {}
+Registered_Nodes = {}
+Master_Services = {}
+
+lock = threading.BoundedSemaphore()
+
+class DistillerMaster(object):
+	def __init__(self,master_endpoint=MASTER_SERVER_ENDPOINT):
+		self.master_endpoint = master_endpoint
+		self.Log = DistillerLogger(MASTER_LOG_FILE,"DistillerMaster")
+
+	def createContext(self):
+		try:
+			self.context = zmq.Context()
+			self.master = self.context.socket(zmq.REP)
+			self.master.bind(self.master_endpoint)
+		except:
+			self.Log.logger.error("ZMQ error in createContext()")
+
+	def registerService(self,server,service,role):
+		try:
+			self.conn = sqlite3.connect(MASTER_DATABASE)
+			self.cursor = self.conn.cursor()
+			UUID = str(uuid.uuid5(uuid.NAMESPACE_DNS,str(server)))
+			DATE = str(datetime.datetime.now())
+			self.query = "SELECT * FROM nodes WHERE uuid='"+UUID+"' AND service='"+service+"'"
+			self.cursor.execute(self.query)
+			row = self.cursor.fetchone()
+			if row is not None:
+					self.query = "UPDATE nodes SET regtime='"+DATE+"' WHERE uuid='"+UUID+"' and service='"+service+"'"
+			else:
+					self.query = "INSERT INTO nodes VALUES('"+UUID+"','"+server+"','"+service+"','"+DATE+"','"+role+"')"
+			self.cursor.execute(self.query)
+			self.conn.commit()
+		except sqlite3.Error, e:
+			self.Log.logger.info("Error %s:" % e.args[0])
+			if self.conn:
+				self.conn.close()
+				del self.conn
+				if self.cursor: del self.cursor
+				if UUID: del UUID
+				if DATE: del DATE
+				if self.query: del self.query
+				if row: del row
+			return False
+		finally:
+			if self.conn:
+				self.conn.close()
+				del self.conn
+				if self.cursor: del self.cursor
+				if UUID: del UUID
+				if DATE: del DATE
+				if self.query: del self.query
+				if row: del row
+				return True
+	def run(self):
+		self.createContext()
+		self.serve_forever()
+			
+
+	def serve_forever(self):
+		statusPoller = DistillerMasterNodeServices()
+		statusPoller.setDaemon(True)
+		statusPoller.start()
+		while True:
+			try:
+				msg = self.master.recv()
+				if msg == "REGISTER":
+					self.master.send("TRY")
+					del msg 
+					msg = self.master.recv()
+					umsg = json.loads(msg)
+					self.Log.logger.info("Registering: Service-> %s Server-> %s " % (umsg["REGISTER_SERVICE"],umsg["SERVER"]))
+					if umsg["REGISTER_SERVICE"].lower() != 'worker' and umsg["REGISTER_SERVICE"].lower() != 'queue' and umsg["REGISTER_SERVICE"].lower() != 'converter' and umsg["REGISTER_SERVICE"].lower() != 'pdfconverter':
+						reg_status = self.registerService(umsg["SERVER"],umsg["REGISTER_SERVICE"],'Master')
+					else:
+						reg_status = self.registerService(umsg["SERVER"],umsg["REGISTER_SERVICE"],'Slave')
+					if reg_status == True:
+						self.master.send("REGISTERED")
+					elif reg_status == False:
+						self.master.send("REG_ERROR")
+					del msg; del umsg; del reg_status
+				elif msg == "PING":
+					self.master.send("PONG")
+					del msg
+				elif msg == "ACTIVE_NODES":
+					self.master.send_pyobj(Active_Nodes)
+					del msg
+				elif msg == "REGISTERED_NODES":
+					self.master.send_pyobj(Registered_Nodes)
+					del msg
+				elif msg == "NODES_STATUS":
+					self.master.send_pyobj(Nodes_Status)
+					del msg
+				elif msg == "MASTER_SERVICES":
+					self.master.send_pyobj(Master_Services)
+					del msg
+				elif msg == States.D_GETSTATUS:
+					self.master.send(States.D_OK)
+					del msg
+			except Exception, e:
+				self.Log.logger.error("serve_forever Error: %s" % e)
+
+
+class DistillerMasterNodeServices(threading.Thread):
+	def run(self):
+		self.Log = DistillerLogger(MASTER_LOG_FILE,"DistillerMasterNodeServices")
+		self.Log.logger.debug("debug")
+		self.context = zmq.Context()
+		while True:
+			# Retrieve ALL registered nodes from database and check their services.
+			try:
+				registered_nodes = []
+				self.conn = sqlite3.connect(MASTER_DATABASE)
+				self.cursor = self.conn.cursor()
+				self.query = "SELECT distinct hostname from nodes where service='Worker'"
+				for row in self.cursor.execute(self.query):
+					registered_nodes.append(str(row[0]))
+					Registered_Nodes[str(row[0])] = "Registered"
+				self.query = "SELECT distinct hostname,service from nodes where role='Master'"
+				master_services = ["Master Server"]
+				for row in self.cursor.execute(self.query):
+					master_services.append(row[1])
+					Master_Services[str(row[0])] = master_services
+			except sqlite3.Error, e:
+				self.Log.logger.info("Error %s:" % e.args[0])
+			finally:
+				if self.conn:
+					self.conn.close()
+					del self.conn
+					if self.cursor: del self.cursor
+					if self.query: del self.query
+					if row: del row	
+			# Update active_nodes table for active hosts that run all services.
+			for host in registered_nodes:
+			    try:
+				node_url = "tcp://"+host+":5002"
+				self.status = self.context.socket(zmq.REQ)
+				self.status.setsockopt(zmq.LINGER,0)
+				self.status.connect(node_url)
+				self.status.send(States.D_GETSTATUS)
+				self.poller = zmq.Poller()
+				self.poller.register(self.status,zmq.POLLIN)
+				UUID = str(uuid.uuid5(uuid.NAMESPACE_DNS,host))
+				if self.poller.poll(1000):
+					msg = self.status.recv_json()
+					if msg:
+						if msg[Services.D_QUEUE] == States.D_RUNNING and msg[Services.D_WORKER] == States.D_RUNNING and msg[Services.D_CONVERTER] == States.D_RUNNING and msg[Services.D_REPOSITORIES] == States.D_OK: 
+
+							self.UpdateActiveNodesTable(UUID,host,"ADD",msg["BUSY_STATUS"])
+							lock.acquire()
+							try:
+								Active_Nodes[host] = UUID
+								Nodes_Status[host] = msg["BUSY_STATUS"]
+							finally:
+								lock.release()
+							if DEBUG_: self.Log.logger.info("Node:%s -> %s" % (host,msg))
+							# Update busy_nodes and nonbusy_nodes for each active node from the list above.
+						else:
+							if DEBUG_: self.Log.logger.info("Node:%s -> %s" % (host,msg))
+							self.UpdateActiveNodesTable(UUID,host,"REMOVE",msg["BUSY_STATUS"])
+							lock.acquire()
+							try:
+								Nodes_Status[host] = "DOWN"
+								try:
+									del Active_Nodes[host]
+								except KeyError,e:
+									self.Log.logger.error("KeyError in Active_Nodes dict %s." % e)
+							finally:
+								lock.release()	
+							if msg[Services.D_REPOSITORIES] == States.D_NOK:
+								self.Log.logger.error("Unmounted repositories in host %s." % host)
+							# Update busy_nodes and nonbusy_nodes for each active node from the list above.
+						del msg
+				else:
+					self.UpdateActiveNodesTable(UUID,host,"REMOVE","None")
+					lock.acquire()
+					try:
+						Nodes_Status[host] = "DOWN"
+					finally:
+						lock.release()
+					if DEBUG_: self.Log.logger.warn("Worker Node '"+host+"' is down")
+			    except zmq.core.error.ZMQError,e:
+			    	self.Log.logger.error("%s" % e)
+			    finally:
+				if self.status: self.status.close()
+	  			if node_url: del node_url
+				if self.status: del self.status
+				if self.poller: del self.poller
+				if UUID: del UUID
+			del registered_nodes
+			time.sleep(2)
+
+	def UpdateActiveNodesTable(self,UUID,host,cmd,busy_status):
+		try:
+			conn = sqlite3.connect(MASTER_DATABASE)
+			cursor = conn.cursor()
+			query = "SELECT * FROM active_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+			cursor.execute(query)
+			row = cursor.fetchone()
+			if row is not None and cmd == "REMOVE":
+					del query
+					query = "DELETE FROM active_nodes"+" WHERE uuid='"+UUID+"'"
+					cursor.execute(query)
+					conn.commit()
+					del query
+					query = "SELECT * FROM busy_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+					cursor.execute(query)
+					del row
+					row = cursor.fetchone()
+					if row is not None:
+						del query
+						query = "DELETE FROM busy_nodes"+" WHERE uuid='"+UUID+"'"
+						cursor.execute(query)
+						conn.commit()
+					del query
+					query = "SELECT * FROM nonbusy_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+					cursor.execute(query)
+					del row
+					row = cursor.fetchone()
+					if row is not None:
+						del query
+						query = "DELETE FROM nonbusy_nodes"+" WHERE uuid='"+UUID+"'"+" and hostname='"+host+"'"
+						cursor.execute(query)
+						conn.commit()
+			if row is None and cmd == "ADD":
+					del query
+					query = "INSERT INTO active_nodes VALUES('"+UUID+"','"+host+"')"
+					cursor.execute(query)
+					conn.commit()
+			elif row is not None and cmd == "ADD":
+					if busy_status == "NO_BUSY":
+						del query
+						query = "SELECT * FROM nonbusy_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+						cursor.execute(query)
+						del row
+						row = cursor.fetchone()
+						if row is None:
+							del query
+							query = "INSERT INTO nonbusy_nodes VALUES('"+UUID+"','"+host+"')"
+							cursor.execute(query)
+							conn.commit()
+							del query
+							query = "SELECT * FROM busy_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+							cursor.execute(query)
+							del row
+							row = cursor.fetchone()
+							if row is not None:
+								del query
+								query = "DELETE FROM busy_nodes"+" WHERE uuid='"+UUID+"'"
+								cursor.execute(query)
+								conn.commit()
+					elif busy_status == "BUSY":
+						del query
+						query = "SELECT * FROM busy_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+						cursor.execute(query)
+						del row
+						row = cursor.fetchone()
+						if row is None:
+							del query
+							query = "INSERT INTO busy_nodes VALUES('"+UUID+"','"+host+"')"
+							cursor.execute(query)
+							conn.commit()
+							del query
+							query = "SELECT * FROM nonbusy_nodes WHERE uuid='"+UUID+"' AND hostname='"+host+"'"
+							cursor.execute(query)
+							del row
+							row = cursor.fetchone()
+							if row is not None:
+								del query
+								query = "DELETE FROM nonbusy_nodes"+" WHERE uuid='"+UUID+"'"
+								cursor.execute(query)
+								conn.commit()
+					
+		except sqlite3.Error, e:
+			self.Log.logger.info("UpdateActiveNodesTable - Error %s:" % e.args[0])
+		finally:
+			if conn:
+				conn.close()
+				del conn
+			if cursor: del cursor
+			if row: del row 
+			if query: del query
+
+class DistillerMasterServer(object):
+	def __init__(self):
+	        self.stdin_path = '/dev/null'
+	        self.stdout_path = '/dev/null'
+	        self.stderr_path = '/dev/null'
+	        self.pidfile_path =  MASTER_PID_FILE
+	        self.pidfile_timeout = 5
+	def run(self):
+		Master = DistillerMaster()
+		Master.run()
+		
+
+if __name__ == "__main__":
+
+	optparser = optparse.OptionParser(usage=usage,version=version)
+	(options, args) = optparser.parse_args()
+	
+	setproctitle.setproctitle(SERVICE_NAME)
+	#Master = DistillerMaster()
+	#Master.run()
+
+	if len(args) == 0:
+	        optparser.print_help()
+	        sys.exit(-1)
+
+
+	if args[0] == 'start':
+		if not os.path.exists(MASTER_PID_FILE):
+			server = DistillerMasterServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._start()
+		else:
+			print "PID File exists: %s" % MASTER_PID_FILE
+	elif args[0] == 'stop':
+		if os.path.exists(MASTER_PID_FILE):
+			server = DistillerMasterServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._stop()
+		else:
+			print "Master server is not running."
+	elif args[0] == 'restart':
+		if os.path.exists(MASTER_PID_FILE):
+			server = DistillerMasterServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._restart()
+		else:
+			server = DistillerMasterServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._start()
+	elif args[0] == 'status':
+		if os.path.exists(MASTER_PID_FILE):
+			fd = open(MASTER_PID_FILE,'r')
+			pid = fd.readlines()[0].strip()
+			fd.close()
+			print "Master server is running, PID: %s" % pid
+		else:
+			print "Master server is not running"
+	elif args[0] == 'log':
+                log = DistillerTailLog(MASTER_LOG_FILE)
+		if len(args) == 2: log.tail(int(args[1])) 
+                log.follow()
+	else:
+	        optparser.print_help()
+	        sys.exit(-1)

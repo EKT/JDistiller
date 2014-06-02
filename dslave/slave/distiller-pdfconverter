@@ -1,0 +1,383 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import platform
+import threading
+from threading import Thread
+from Queue import Queue
+import time
+import optparse
+import os
+import os.path
+import sys
+import signal
+from daemon import runner
+import logging
+import fnmatch
+#import popen2,commands
+import glob
+import uuid
+import subprocess
+import traceback
+import ConfigParser
+import cPickle
+from datetime import datetime
+import setproctitle
+# jp2k-distiller Modules
+from dutils import ColorAttr,States,DistillerLogger
+from dutils import DistillerTailLog
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log	    watch server daemon logfile
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log	  # watch daemon's logfile
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+SERVICE_NAME='distiller-pdfconverter'
+# Configuration file
+_conffile='distiller_slave.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+MASTER_HOSTNAME = config.get("MASTER","Hostname")
+
+PDFCONVERTER_ENDPOINT=config.get("PDFCONVERTER","Endpoint")
+PDFCONVERTER_STATUS_ENDPOINT=config.get("PDFCONVERTER","StatusEndpoint")
+MASTER_ENDPOINT="tcp://"+MASTER_HOSTNAME+":5001"
+PDFCONVERTER_LOG_FILE=config.get("PDFCONVERTER","LogFile")
+PDFCONVERTER_PID_FILE=config.get("PDFCONVERTER","PidFile")
+CONVERT_CMD=config.get("PDFCONVERTER","ConvertCmd")
+
+busy_flag = False
+
+lock = threading.BoundedSemaphore()
+
+class DistillerPdfConverter(object):
+	def __init__(self,pdfconverter_ipc_endpoint=PDFCONVERTER_ENDPOINT,master_endpoint=MASTER_ENDPOINT):
+		self.pdfconverter_ipc_endpoint = pdfconverter_ipc_endpoint
+		self.master_endpoint = master_endpoint
+                self.Log = DistillerLogger(PDFCONVERTER_LOG_FILE,"DistillerConverter")
+		self.tif2pdfqueue = Queue()
+		
+
+	def registerPdfConverterService(self):
+		self.register_service = self.context.socket(zmq.REQ)
+		self.register_service.connect(self.master_endpoint)
+		self.register_service.send("REGISTER")
+                msg = self.register_service.recv()
+                if msg == States.D_TRY:
+			self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"PdfConverter","SERVER":platform.node()})))
+			reg_status = self.register_service.recv()
+			if reg_status == States.D_REGISTERED:
+				self.Log.logger.info("Registered to master server")
+			elif reg_status == States.D_REG_ERROR:
+				self.Log.logger.info("Cannot register to master server")
+				sys.exit(2)
+			self.register_service.close()
+			del self.register_service
+		elif msg != States.D_TRY:
+			self.Log.logger.info("Message error.Cannot register to master server.")
+                        sys.exit(2)
+
+	def createContext(self):
+		self.context = zmq.Context()
+		self.pdfconv = self.context.socket(zmq.PULL)
+		self.pdfconv.connect(self.pdfconverter_ipc_endpoint)
+		self.registerPdfConverterService()
+
+	def startPdfSubJob(self,jp2_dir,export_pdffilename):
+		if len(jp2_dir.split(".")) > 1:
+			stdoutFile = jp2_dir.split(".")[0]+".pdf.stdout"
+			stderrFile = jp2_dir.split(".")[0]+".pdf.stderr"
+		elif  len(jp2_dir.split(".")) == 1:
+			stdoutFile = jp2_dir+"/"+jp2_dir.split("/")[-1]+".pdf.stdout"
+			stderrFile = jp2_dir+"/"+jp2_dir.split("/")[-1]+".pdf.stderr"
+		#Read metadata txt file and retrieve QUALITY field. Insert it into PDF_cmd args. #FIXME!!!!!!!
+		PDF_cmd = ["/bin/nice",
+			   "-n","20",
+			   "/usr/bin/convert",
+			   "-quality","50",
+			   jp2_dir+"/*.jp2",
+			   export_pdffilename]
+
+		
+		self.Log.logger.info(PDF_cmd)
+		status = None
+		try:
+			sp = subprocess.Popen(args=PDF_cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+			status = True
+		except Exception,e:
+			self.Log.logger.error("ImageMagick Convert Error Exception: Conversion to PDF failed -> %s" % export_pdffilename)
+			self.Log.logger.error("ImageMagick Convert Error -> %s" % e)
+			status = False
+		stdout,stderr = sp.communicate()
+		if stderr:
+			self.Log.logger.error("ImageMagick COonvertError: Conversion to PDF failed -> %s" % export_pdffilename)
+			status = False
+			# Write stderr to local file
+			fd = open(stderrFile,"w")
+			fd.write(stderr)
+			fd.close()
+			del fd
+		# Write stdout to local file
+		fd = open(stdoutFile,"w")
+		fd.write(stdout)
+		fd.close()
+		return status
+
+
+	def startTifPdfBatchJob(self,dirname):
+		if len(dirname.split(".")) > 1:
+			export_pdffilename = dirname.split(".")[0]+".pdf"
+		elif  len(dirname.split(".")) == 1:
+			export_pdffilename = dirname+"/"+dirname.split("/")[-1]+".pdf"
+			
+		#if os.path.exists(statusFile) is True:
+		#	try:
+		#		statusData = cPickle.load(open(statusFile,"rb"))
+		#	except Exception, e:
+		#		self.Log.logger.error("startTifJp2BatchJob: Cannot read status file %s" % statusFile)
+		#else:
+		#	try:
+		#		statusData = {"creationdate": datetime.utcnow(),"pdf2png": None, "png2jp2": None, "tiff2jp2": None, "node": platform.node()}
+		#		cPickle.dump(statusData,open(statusFile,"wb"))
+		#	except Exception, e:
+		#		self.Log.logger.error("startTifJp2BatchJob: Cannot create/write status file %s" % statusFile)
+		
+		#startTime = datetime.now()
+		ret_status = self.startPdfSubJob(dirname,export_pdffilename)
+		#if ret_status == True:
+		#	endTime = datetime.now()
+		#	statusData["tiff2pdf"]=str(endTime-startTime)
+		#	try:
+		#		cPickle.dump(statusData, open(statusFile,"wb"))
+		#	except Exception, e:
+		#		self.Log.logger.error("Cannot write status file %s. Error %s." % (statusFile,e))
+		if not ret_status:
+			#TODO: sendmail "PDF Converter ErrorPDF file %s cannot be created." % export_pdffilename
+			old_lockdir = os.path.join(dirname,"dlock.pdf.send")
+			new_failedlockdir = os.path.join(dirname,"dlock.pdf.failed")
+			os.rename(old_lockdir,new_failedlockdir)
+		elif ret_status:
+			old_lockdir = os.path.join(dirname,"dlock.pdf.send")
+			new_unlockdir = os.path.join(dirname,"dlock.pdf.ok")
+			os.rename(old_lockdir,new_unlockdir)
+		return ret_status
+
+	def findjp2files_extract_dir(self,dirname):
+		unconverted_dirs = set()
+		for path,dirs,files in os.walk(dirname):
+                        for file in files:
+                                if fnmatch.fnmatch(file.lower(),"*.jp2"):
+					unconverted_dirs.add(path)
+		if len(unconverted_dirs) > 0:
+			return list(unconverted_dirs)
+		return []
+	
+	def makeCallback(self,dirname):
+		#make callback
+		#rename directory to dlock.pdf.done ? Maybe a file ?
+		pass
+
+
+	def Tiff2PdfWorker(self,jqueue):
+		while True:
+			dirname = jqueue.get()
+			Jp2DirName = self.findjp2files_extract_dir(dirname)
+			if len(Jp2DirName) > 0:
+				created_objects = len(Jp2DirName)
+				while len(Jp2DirName) > 0:
+					jp2dir = Jp2DirName.pop()
+					ret_status = self.startTifPdfBatchJob(jp2dir)
+					if ret_status:
+						created_objects -= 1
+						self.Log.logger.info(jp2dir+" directory has been converted to a PDF file")
+					else:
+						self.Log.logger.error(jp2dir+" directory cannot be converted to a PDF file")
+					if created_objects == 0:
+						self.makeCallback(dirname)
+			jqueue.task_done()
+
+	def detectCPUs(self):
+		if hasattr(os,"sysconf"):
+			if os.sysconf_names.has_key("SC_NPROCESSORS_ONLN"):
+				ncpus = os.sysconf("SC_NPROCESSORS_ONLN")
+       				if isinstance(ncpus, int) and ncpus > 0:
+           				return ncpus
+		return None
+
+	def startWorkers(self,pthreads):
+		for i in range(int(pthreads)):
+			pworker = Thread(target=self.Tiff2PdfWorker, args=(self.tif2pdfqueue,))
+			pworker.setDaemon(True)
+			pworker.start()
+
+
+	def serve_forever(self):
+		statusServer = DistillerPdfConverterStatus()
+		statusServer.setQueues(self.tif2pdfqueue)
+		statusServer.setDaemon(True)
+		statusServer.start()
+		cpu_cores = self.detectCPUs()
+		#self.startWorkers(cpu_cores)	
+		self.startWorkers(1)	
+		objectcounter=0
+		global busy_flag
+		while True:
+			lock.acquire()
+			try:
+				busy_flag = False
+			finally:
+				lock.release()
+			msg = self.pdfconv.recv()
+			if msg == States.D_FIREUP:
+				if self.tif2pdfqueue.qsize() > 0:
+					lock.acquire()
+					try:
+						busy_flag = True
+					finally:
+						lock.release()
+					self.Log.logger.info("Starting pdf conversion job(s).")
+					self.tif2pdfqueue.join()
+					self.Log.logger.info("..finished pdf conversion.")
+					objectcounter=0
+				elif self.tif2pdfqueue.qsize() == 0 and objectcounter > 0:
+					lock.acquire()
+					try:
+						busy_flag = True
+					finally:
+						lock.release()
+					self.Log.logger.info("Starting pdf conversion job(s).")
+					self.tif2pdfqueue.join()
+					self.Log.logger.info("..finished pdf conversion.")
+					objectcounter=0
+			else:
+				self.tif2pdfqueue.put(msg)
+				objectcounter+=1
+				self.Log.logger.info("Adding directory for pdf conversion %s" % msg)
+			#self.Log.logger.info("Got %s" % msg)
+
+
+class DistillerPdfConverterStatus(threading.Thread):
+	def setQueues(self,pdfqueue):
+		self.pdfqueue = pdfqueue
+	def run(self):
+		self.context = zmq.Context()
+		self.status = self.context.socket(zmq.REP)
+		self.status.bind(PDFCONVERTER_STATUS_ENDPOINT)
+                self.Log = DistillerLogger(PDFCONVERTER_LOG_FILE,"DistillerPdfConverterStatus")
+		global busy_flag
+		while True:
+			status_msg = self.status.recv()
+			if status_msg == "GET_STATUS":
+				self.status.send("OK")
+			elif status_msg == "GET_BUSY":
+				if busy_flag == True:
+					self.status.send("BUSY")
+				elif busy_flag == False:
+					self.status.send("NO_BUSY")
+			elif status_msg == "GET_QUEUES_SIZE":
+					self.status.send_pyobj({"PDFQUEUE":self.pdfqueue.qsize()})
+			else:
+				self.status.send("ERROR")
+
+
+class DistillerPdfConverterServer(object):
+	def __init__(self):
+                self.stdin_path = '/dev/null'
+                self.stdout_path = '/dev/null'
+                self.stderr_path = '/dev/null'
+                self.pidfile_path =  PDFCONVERTER_PID_FILE
+                self.pidfile_timeout = 5
+        def run(self):
+		PdfConverter = DistillerPdfConverter()
+		PdfConverter.createContext()
+		PdfConverter.serve_forever()
+
+
+
+if __name__ == "__main__":
+	
+	optparser = optparse.OptionParser(usage=usage,version=version)
+        (options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+	
+        if len(args) == 0:
+                optparser.print_help()
+                sys.exit(-1)
+
+        if args[0] == 'start':
+                if not os.path.exists(PDFCONVERTER_PID_FILE):
+                        server = DistillerPdfConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+                else:
+                        print "PID File exists: %s" % PDFCONVERTER_PID_FILE
+        elif args[0] == 'stop':
+                if os.path.exists(PDFCONVERTER_PID_FILE):
+                        server = DistillerPdfConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._stop()
+                else:
+                        print "PdfConverter slave server is not running."
+        elif args[0] == 'restart':
+                if os.path.exists(PDFCONVERTER_PID_FILE):
+                        server = DistillerPdfConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._restart()
+                else:
+                        server = DistillerPdfConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+        elif args[0] == 'status':
+                if os.path.exists(PDFCONVERTER_PID_FILE):
+                        fd = open(PDFCONVERTER_PID_FILE,'r')
+                        pid = fd.readlines()[0].strip()
+                        fd.close()
+                        print "PdfConverter slave server is running, PID: %s" % pid
+                else:
+                        print "PdfConverter slave server is not running"
+	elif args[0] == 'log':
+                log = DistillerTailLog(PDFCONVERTER_LOG_FILE)
+                log.follow()
+	elif args[0] == 'foreground':
+		PdfConverter = DistillerPdfConverter()
+		PdfConverter.createContext()
+		PdfConverter.serve_forever()
+        else:
+                optparser.print_help()
+                sys.exit(-1)

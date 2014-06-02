@@ -1,0 +1,749 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import time
+import sqlite3
+import optparse
+import os
+import os.path
+import sys
+import signal
+import logging
+import platform
+import re
+import itertools
+from daemon import runner
+import fnmatch
+import uuid
+import shutil
+import traceback
+import ConfigParser
+import psycopg2
+import threading
+import glob
+import setproctitle
+import urllib
+# jp2k-distiller Modules
+from dutils import DistillerLogger,States,DistillerLoggerServer
+from dutils import DistillerMailer,MailerStates,DistillerTailLog
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log	    watch server daemon logfile
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log	  # watch daemon's logfile
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+SERVICE_NAME="distiller-exporter"
+# Configuration file
+_conffile='distiller_master.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+SSHUser=config.get("EXPORTER","SSHUser")
+RSA_Private_Key=config.get("EXPORTER","RSA_Private_Key")
+RSA_Private_Key_Password=config.get("EXPORTER","RSA_Private_Key_Password")
+RemoteHost=config.get("EXPORTER","RemoteHost")
+RemotePort=int(config.get("EXPORTER","RemotePort"))
+EnableRemoteCopy=config.get("EXPORTER","EnableRemoteCopy")
+
+EXPORTER_LOG_FILE=config.get("EXPORTER","ExporterLogFile")
+MASTER_ENDPOINT=config.get("EXPORTER","MasterServerEndpoint")
+EXPORTER_STATUS_ENDPOINT=config.get("EXPORTER","ExporterStatusEndpoint")
+EXPORTER_PID_FILE=config.get("EXPORTER","ExporterPIDFile")
+
+MAIN_REPOSITORY=config.get("EXPORTER","LocalRepository")
+EXPORT_REPOSITORY=config.get("EXPORTER","ExportRepository")
+FAILED_REPOSITORY=config.get("EXPORTER","FailedRepository")
+REMOTE_REPOSITORY=config.get("EXPORTER","RemoteRepository")
+
+EMAIL_SERVER=config.get("EMAIL","SMTPServer")
+MAILING_LIST=config.get("EMAIL","Users").split(',')
+
+class DistillerExporter(object):
+	def __init__(self,master_endpoint=MASTER_ENDPOINT):
+		self.master_endpoint = master_endpoint
+		self.Log = DistillerLogger(EXPORTER_LOG_FILE,"DistillerExporter")
+		self.LogServer = DistillerLoggerServer("tcp://0.0.0.0:5003","DistillerExporter") #FIXME: Hardcoded
+		self.mailer = DistillerMailer(EMAIL_SERVER,MAILING_LIST,EXPORTER_LOG_FILE)
+
+	def registerExporterServer(self):
+		self.context = zmq.Context()
+		self.register_service = self.context.socket(zmq.REQ)
+		self.register_service.connect(self.master_endpoint)
+		self.register_service.send("REGISTER")
+		msg = self.register_service.recv()
+		if msg == States.D_TRY:
+			self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"Export Server","SERVER":platform.node()})))
+			reg_status = self.register_service.recv()
+			self.register_service.close()
+			self.context.term()
+			if reg_status == States.D_REGISTERED:
+				self.Log.logger.info("Registered to master server")
+				self.LogServer.info("Registered to master server")
+			elif reg_status == States.D_REG_ERROR:
+				self.Log.logger.info("Cannot register to master server")
+				self.LogServer.info("Cannot register to master server")
+				sys.exit(2)
+			del self.register_service; del self.context
+		elif msg != States.D_TRY:
+			self.Log.logger.info("Message error.Cannot register to master server.")
+			sys.exit(2)
+
+	
+	def hasbeenconverted(self,path):
+		cpath = path.rsplit('/',1)[0]
+		pdf_files = []
+		tiff_files = False
+		pdf_status = []
+		tiff_status = None
+		for fname in os.listdir(cpath):
+			if fnmatch.fnmatch(fname.lower(),"*.pdf") and os.path.isfile(os.path.join(cpath,fname)):
+				pdf_files.append(os.path.join(cpath,fname))
+			if fnmatch.fnmatch(fname.lower(),"*.tif") and os.path.isfile(os.path.join(cpath,fname)):
+				tiff_files = True
+			if fnmatch.fnmatch(fname.lower(),"*.tiff") and os.path.isfile(os.path.join(cpath,fname)):
+				tiff_files = True
+		if len(pdf_files) > 0:
+			for fname in pdf_files:
+				if "PDF" in fname:
+					jp2_name = fname.replace("PDF","jp2")
+				elif "pdf" in fname:
+					jp2_name = fname.replace("pdf","jp2")
+				if os.path.isfile(jp2_name+"/done.sig"):
+					pdf_status.append(True)
+				else:
+					pdf_status.append(False)
+		if tiff_files is True:
+			if os.path.isfile(path+"/done.sig"):
+				tiff_status = True
+		if False not in pdf_status and tiff_status is None:
+			return True
+		if False not in pdf_status and tiff_status is True:
+			return True
+		if len(pdf_status) == 0 and tiff_status is True:
+			return True
+
+	def scanRepository(self,repository_dir):
+		converted_dirnames = []
+		for path,dirs,files in os.walk(repository_dir):
+			for dname in dirs:
+				if fnmatch.fnmatch(dname.lower(),"*.jp2"):
+					if self.hasbeenconverted(os.path.join(path,dname)):
+						converted_dirnames.append(os.path.join(path,dname))
+		return converted_dirnames
+
+	def scanForFailedConversions(self,repository_dir):
+		failed_dirnames = []
+		for path,dirs,files in os.walk(repository_dir):
+			for dname in dirs:
+				if fnmatch.fnmatch(dname.lower(),"failed.lock"):
+					failed_dirnames.append(os.path.join(path,dname))
+		return failed_dirnames
+
+	def checkSignature(self,pathname):
+		try:
+			f = open(pathname,"r")
+			sig = str(f.read().strip())
+			f.close()
+			uuid_pathname = pathname.split("/")
+			###/
+			self.Log.logger.error("@@@@@"+str(uuid_pathname[-1]))
+			del uuid_pathname[-1]
+			UUID = str(uuid.uuid5(uuid.NAMESPACE_URL,'/'.join(uuid_pathname)))
+			if UUID == sig:
+				return True
+			else:
+				return False			
+		except:
+			self.Log.logger.error("Failed to read signature in %s" % pathname)
+			self.LogServer.error("Failed to read signature in %s" % pathname)
+			try:
+				f.close()
+			except:
+				self.Log.logger.error("Failed to close file %s" % pathname)
+				self.LogServer.error("Failed to close file %s" % pathname)
+				return False
+			return False
+
+	def save_statistics(self,directory):
+		try:
+			context = zmq.Context()
+			socket = context.socket(zmq.REQ)
+			socket.connect("ipc:///tmp/distiller_statistics.0")
+			socket.send_pyobj(directory)
+			msg = socket.recv()
+			if msg == "ACK_DIR":
+				socket.close()
+				context.destroy()
+			else:
+				raise Exception
+		except Exception, e:
+			self.Log.logger.error("Cannot communicate with statistics server. Error: %s" % e)
+			self.LogServer.error("Cannot communicate with statistics server. Error: %s" % e)
+			#FIXME - Save it locally to an database and later check with a new thread failed dirs and send them to statistics server
+	
+	def find_txt_files(self,directory):
+		return glob.glob1(directory,"*.txt")
+	
+	def call_urlcallback(self,fname):
+		#FIXME - Check potential mem leak 
+		config =  ConfigParser.RawConfigParser()
+		url = None
+		try:
+                        config.read(fname)
+                        url = str(config.get("callback","url"))
+                except Exception, e:
+                        self.Log.logger.error("ConfigParser Error: %s" % e)
+                        self.LogServer.error("ConfigParser Error: %s" % e)
+                if url is not None:
+                        try:
+                                f=urllib.urlopen(url)
+                                ans = f.read()
+                                f.close()
+                        except Exception, e:
+                                self.Log.logger.error("urllib.urlopen Error: %s" % e)
+                                self.LogServer.error("urllib.urlopen Error: %s" % e)
+
+	def call_dspace_callback(self,directory):
+		txt_files = None
+		if os.path.exists(directory):
+			self.Log.logger.debug("Calling callback file in directory: %s" % directory)
+			txt_files = self.find_txt_files(directory)
+		else:
+			self.Log.logger.error("Directory %s does not exist." % directory)
+			self.LogServer.error("Directory %s does not exist." % directory)
+		if txt_files is not None:
+			for fname in txt_files:
+					self.Log.logger.debug("Calling %s" % os.path.join(directory,fname))
+					self.call_urlcallback(os.path.join(directory,fname))
+
+	def move_locally(self,dirs,dest):
+		for dname in dirs:
+			try:
+				temp_dist = dname.split(MAIN_REPOSITORY)
+				src_dir = dname
+				dst_dir = dest+temp_dist[1]
+				if os.path.isdir(dst_dir):
+					shutil.rmtree(dst_dir)
+					self.Log.logger.info("Removing directory that already exists: %s" % dst_dir)
+					self.LogServer.info("Removing directory that already exists: %s" % dst_dir)
+				shutil.move(src_dir,dst_dir)
+				self.Log.logger.info("Moved directory %s to %s" % (src_dir,dst_dir))
+				self.LogServer.info("Moved directory %s to %s" % (src_dir,dst_dir))
+			except shutil.Error:
+				self.Log.logger.error("Cannot move directory %s to %s" % (src_dir,dst_dir))
+				self.LogServer.error("Cannot move directory %s to %s" % (src_dir,dst_dir))
+			except IOError:
+				self.Log.logger.error("Cannot move directory %s to %s" % (src_dir,dst_dir))
+				self.LogServer.error("Cannot move directory %s to %s" % (src_dir,dst_dir))
+			except OSError:
+				self.Log.logger.error("Cannot move directory %s to %s" % (src_dir,dst_dir))
+				self.LogServer.error("Cannot move directory %s to %s" % (src_dir,dst_dir))
+		for dname in dirs:
+			try:
+				temp_dist = dname.split(MAIN_REPOSITORY)
+				src_dir = dname
+				dst_dir = dest+temp_dist[1]
+				print src_dir, dst_dir
+				print dname
+				self.remove_src_dir_after_copy(src_dir,dst_dir)
+				self.save_statistics(dst_dir.rsplit('/',1)[0])
+				self.call_dspace_callback(dst_dir.rsplit('/',1)[0])
+			except Exception,e:
+				self.Log.logger.error("move_locally Error: %s" % e)
+		
+
+	def remove_src_dir_after_copy(self,src_dir,dst_dir):
+		src_pdf_file_lower = src_dir.rsplit('.jp2',1)[0]+'.pdf'
+		src_pdf_file_capital = src_dir.rsplit('.jp2',1)[0]+'.PDF'
+		dst_pdf_file_lower = dst_dir.rsplit('.jp2',1)[0]+'.pdf'
+		dst_pdf_file_capital = dst_dir.rsplit('.jp2',1)[0]+'.PDF'
+		if os.path.isfile(src_pdf_file_lower):
+			src_pdf_file = src_pdf_file_lower
+			dst_pdf_file = dst_pdf_file_lower
+		elif os.path.isfile(src_pdf_file_capital):
+			src_pdf_file = src_pdf_file_capital
+			dst_pdf_file = dst_pdf_file_capital
+		else:
+			src_pdf_file = src_pdf_file_lower
+		if os.path.isfile(src_pdf_file):
+			local_exported = dst_dir.rsplit('/',1)[0]
+			if os.path.isfile(dst_pdf_file):
+				try:
+					os.unlink(dst_pdf_file)
+					self.Log.logger.info("Local pdf file %s exists. Moving it to local exported file %s" % (src_pdf_file,dst_pdf_file))
+					self.LogServer.info("Local pdf file %s exists. Moving it to local exported file %s" % (src_pdf_file,dst_pdf_file))
+					shutil.copy2(src_pdf_file,dst_pdf_file)
+					os.unlink(src_pdf_file)
+				except shutil.Error:
+					self.Log.logger.error("shutil error while trying to copy %s to %s" % (src_pdf_file,dst_pdf_file))
+					self.LogServer.error("shutil error while trying to copy %s to %s" % (src_pdf_file,dst_pdf_file))
+				except OSError:
+					self.Log.logger.error("OSError while trying to unlink (%s,%s)" % (src_pdf_file,dst_pdf_file))
+					self.LogServer.error("OSError while trying to unlink (%s,%s)" % (src_pdf_file,dst_pdf_file))
+				        self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+				except:
+					self.Log.logger.error("remove_src_dir_after_copy: Unhandled exception occured,Traceback follows.")
+					self.LogServer.error("remove_src_dir_after_copy: Unhandled exception occured,Traceback follows.")
+				        self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+			else:
+				try:
+					self.Log.logger.info("Local pdf file %s exists. Moving it to local exported file %s" % (src_pdf_file,dst_pdf_file))
+					self.LogServer.info("Local pdf file %s exists. Moving it to local exported file %s" % (src_pdf_file,dst_pdf_file))
+					shutil.copy2(src_pdf_file,dst_pdf_file)
+					os.unlink(src_pdf_file)
+				except shutil.Error:
+					self.Log.logger.error("shutil error while trying to copy %s to %s" % (src_pdf_file,dst_pdf_file))
+					self.LogServer.error("shutil error while trying to copy %s to %s" % (src_pdf_file,dst_pdf_file))
+				except OSError:
+					self.Log.logger.error("OSError while trying to unlink (%s)" % (src_pdf_file))
+					self.LogServer.error("OSError while trying to unlink (%s)" % (src_pdf_file))
+				        self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+				except:
+					self.Log.logger.error("remove_src_dir_after_copy: Unhandled exception occured,Traceback follows.")
+					self.LogServer.error("remove_src_dir_after_copy: Unhandled exception occured,Traceback follows.")
+				        self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+		
+		for path,dirs,files in os.walk(src_dir.rsplit('/',1)[0]):
+			self.Log.logger.debug(dirs) #DEBUG
+			for fname in files:
+				if fnmatch.fnmatch(fname.lower(),"*.tif") or fnmatch.fnmatch(fname.lower(),"*.txt") or fnmatch.fnmatch(fname.lower(),"*.dps") or fnmatch.fnmatch(fname.lower(),"*.stdout") or fnmatch.fnmatch(fname.lower(),"*.stderr") or fnmatch.fnmatch(fname.lower(),"*.pdf"): #This is not the write way for multifile support, when src_dir comes in deletes all other files except those here, doit in two steps, COPY and then REMOVE
+					try:
+						src_tiff_file = os.path.join(path,fname)
+						dst_tiff_file = os.path.join(dst_dir.rsplit('/',1)[0],fname)
+						if os.path.isfile(dst_tiff_file):
+							try:
+								self.Log.logger.info("Removing %s" % dst_tiff_file)
+								self.LogServer.info("Removing %s" % dst_tiff_file)
+								os.unlink(dst_tiff_file)
+							except OSError:
+								self.Log.logger.error("Cannot remove %s file" % dst_tiff_file)
+								self.LogServer.error("Cannot remove %s file" % dst_tiff_file)
+						self.Log.logger.info("Copying %s to %s" % (src_tiff_file,dst_tiff_file))
+						self.LogServer.info("Copying %s to %s" % (src_tiff_file,dst_tiff_file))
+						shutil.copy2(src_tiff_file,dst_tiff_file)
+						self.Log.logger.info("Removing %s" % src_tiff_file)
+						self.LogServer.info("Removing %s" % src_tiff_file)
+						os.unlink(src_tiff_file)
+					except shutil.Error:
+						self.Log.logger.error("Cannot copy: %s to %s" % (src_tiff_file,dst_tiff_file))
+						self.LogServer.error("Cannot copy: %s to %s" % (src_tiff_file,dst_tiff_file))
+					except OSError:
+						self.Log.logger.error("Cannot remove %s" % (src_tiff_file))
+						self.LogServer.error("Cannot remove %s" % (src_tiff_file))
+					except:
+						self.Log.logger.error("remove_src_dir_after_copy: Unhandled exception occured,Traceback follows.")
+						self.LogServer.error("remove_src_dir_after_copy: Unhandled exception occured,Traceback follows.")
+					        self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+
+		for path,dirs,files in os.walk(src_dir.rsplit('/',1)[0]):
+			for dname in dirs:
+				if fnmatch.fnmatch(dname.lower(),"*.png"):
+					try:
+						self.Log.logger.info("Removing PNG directory: %s" % os.path.join(path,dname))
+						self.LogServer.info("Removing PNG directory: %s" % os.path.join(path,dname))
+						shutil.rmtree(os.path.join(path,dname))
+					except shutil.Error:
+						self.Log.logger.error("Cannot remove: %s" % os.path.join(path,dname))
+						self.LogServer.error("Cannot remove: %s" % os.path.join(path,dname))
+					except OSError:
+						self.Log.logger.error("Cannot remove: %s" % os.path.join(path,dname))
+						self.LogServer.error("Cannot remove: %s" % os.path.join(path,dname))
+
+		# Check if directory is empty, if it's empty remove it
+		for path,dirs,files in os.walk(src_dir.rsplit('/',1)[0]):
+			if len(files) != 0:
+				self.Log.logger.info("Directory %s is not empty." % src_dir.rsplit('/',1)[0])
+				self.LogServer.info("Directory %s is not empty." % src_dir.rsplit('/',1)[0])
+			else:
+				self.Log.logger.info("Directory %s is empty.Remove it" % src_dir.rsplit('/',1)[0])
+				self.LogServer.info("Directory %s is empty.Remove it" % src_dir.rsplit('/',1)[0])
+				try:
+					shutil.rmtree(src_dir.rsplit('/',1)[0])
+				except:
+					self.Log.logger.error("Cannot remove: %s directory" % src_dir.rsplit('/',1)[0])
+					self.LogServer.error("Cannot remove: %s directory" % src_dir.rsplit('/',1)[0])
+					self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+
+	def populate_postgresql_djatoka_db(self,postgresql_djatoka):
+		PostgreSQLDB=config.get("DJATOKA_POSTGRESQL","PostgreSQLDB")
+		PostgreSQLUser=config.get("DJATOKA_POSTGRESQL","PostgreSQLUser")
+		PostgreSQLHost=config.get("DJATOKA_POSTGRESQL","PostgreSQLHost")
+		PostgreSQLPassword=config.get("DJATOKA_POSTGRESQL","PostgreSQLPassword")
+		PostgreSQLTable=config.get("DJATOKA_POSTGRESQL","PostgreSQLTable")
+		try:
+	                conn =  psycopg2.connect("dbname='"+str(PostgreSQLDB)+"' user='"+str(PostgreSQLUser)+"' host='"+str(PostgreSQLHost)+"' password='"+str(PostgreSQLPassword)+"'")
+	        except psycopg2.Error,e:
+	                self.Log.logger.error("PostgreSQL Error %d: %s" % (e.args[0], e.args[1]))
+	                return False
+	        try:
+	                cursor = conn.cursor()
+	        except psycopg2.Error,e:
+	                self.Log.logger.error("PostgreSQL Error: %s" % "Connecting to DB failed")
+	                return False
+	        for link in postgresql_djatoka:
+	                sql_query="INSERT INTO "+PostgreSQLTable+" VALUES ('info:"+os.path.normpath(link)+"','"+os.path.normpath(link)+"')"
+	                self.Log.logger.info("PostgreSQL: %s " % sql_query)
+	                self.LogServer.info("PostgreSQL: %s " % sql_query)
+	                try:
+        	                cursor.execute(sql_query)
+	                        conn.commit()
+	                except psycopg2.Error,e:
+	                        self.Log.logger.error("PostgreSQL Error in Query: %s" % sql_query)
+	                        self.Log.logger.error("Error: %s" % e)
+	                        self.LogServer.error("PostgreSQL Error in Query: %s" % sql_query)
+	                        self.LogServer.error("Error: %s" % e)
+				# Never leave loop, some transactions already exist cause pdf/tif files maybe reconverted
+	        cursor.close ()
+	        conn.close ()
+		return True
+	
+
+	def move_toremotedestination(self,hostname,port,username,rsa_private_key,rsa_private_key_password,src_dnames,dst_dname):
+		hostkeytype=None
+		hostkey=None
+		try:
+			host_keys = self.paramiko.util.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
+		except IOError,e:
+			self.Log.logger.error(e)
+			host_keys = {}
+		if host_keys.has_key(hostname):
+			hostkeytype = host_keys[hostname].keys()[0]
+			hostkey = host_keys[hostname][hostkeytype]
+			self.Log.logger.info("Using host key type: %s" % hostkeytype)
+			self.LogServer.info("Using host key type: %s" % hostkeytype)
+
+		self.Log.logger.info("Establishing SSH connection to %s:%s..." % (hostname,port))
+		self.LogServer.info("Establishing SSH connection to %s:%s..." % (hostname,port))
+		
+		try:
+			t = self.paramiko.Transport((hostname,port))
+			self.Log.logger.info("Created paramiko transport layer.")
+		except:
+			self.Log.logger.error("Paramiko Transport Layer Error for %s:%s" % (hostname,port))
+			self.Log.logger.error("Exception Class: %s" % e.__class__)
+			return False
+		
+		try:
+			t.start_client()
+			self.Log.logger.info("Negotiated successfully paramiko SSH client.")
+			self.LogServer.info("Negotiated successfully paramiko SSH client.")
+		except Exception,e:
+			self.Log.logger.error("Paramiko Client Negotiation Error for %s:%s" % (hostname,port))
+			self.Log.logger.error("Error :%s" % e)
+			self.Log.logger.error("Exception Class: %s" % e.__class__)
+			#self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+			return False
+		
+		try:
+			if rsa_private_key_password is None:
+				ki = self.paramiko.RSAKey.from_private_key_file(rsa_private_key,password=None)
+			else:
+				ki = self.paramiko.RSAKey.from_private_key_file(rsa_private_key,password=rsa_private_key_password)
+		#FIXME: Why when exception is catched crashes? paramiko Bug for sure?.
+		#except self.paramiko.PasswordRequiredException:
+		#	self.Log.logger.error("Password required for %s %s" % (rsa_private_key,e))
+		#	self.Log.logger.error("Please use a password in the rsa_private_key_password field in the configuration file")
+			#self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+		#	return False
+		except Exception,e:
+			self.Log.logger.error("Failed loading %s.%s." % (rsa_private_key,e))
+			self.Log.logger.error("You might need to use a password in the rsa_private_key_password field in the configuration file")
+			self.Log.logger.error("Exception Class: %s" % e.__class__)
+			return False
+
+		try:
+			agent = self.paramiko.Agent()
+		except Exception,e:
+			self.Log.logger.error("Cannot create paramiko agent.")
+			self.Log.logger.error("Exception Class: %s" % e.__class__)
+			return False
+		agent_keys = agent.get_keys()+(ki,)
+		if len(agent_keys) == 0:
+			self.Log.logger.error("No agent keys...")
+			return False
+		for key in agent_keys:
+			self.Log.logger.info('Trying ssh-agent key %s' % key.get_fingerprint().encode('hex'))
+			self.LogServer.info('Trying ssh-agent key %s' % key.get_fingerprint().encode('hex'))
+			try:
+				t.auth_publickey(username,key)
+				self.Log.logger.info("...success")
+				self.LogServer.info("...success")
+				break
+			#except self.paramiko.SSHException,e:
+			#	self.Log.logger.error("...failed")
+			#	self.Log.logger.error("%s" % e)
+			#	self.Log.logger.error("Exception Class: %s" % e.__class__)
+			#	return False
+			except Exception,e:
+				self.Log.logger.error("...failed")
+				self.Log.logger.error("%s" % e)
+				self.Log.logger.error("Exception Class: %s" % e.__class__)
+				return False
+
+		if not t.is_authenticated():
+			self.Log.logger.error("RSA Key auth failed!...")
+			return False
+		else:
+			sftp = t.open_session()
+			self.Log.logger.info('Session opened...')
+			self.LogServer.info('Session opened...')
+		sftp = self.paramiko.SFTPClient.from_transport(t)
+		self.Log.logger.debug(sftp.listdir("."))
+		export_dir = dst_dname+"/"
+
+		for path in src_dnames:
+			files_copied=0
+			postgresql_djatoka = []
+			path_split = path.split('/')
+			try:
+				sftp.mkdir(os.path.join(export_dir,path_split[3]))
+			except IOError,e:
+				self.Log.logger.info("Remote directory %s already exists" % os.path.join(export_dir,path_split[3]))
+				self.LogServer.info("Remote directory %s already exists" % os.path.join(export_dir,path_split[3]))
+			newdir = os.path.join(export_dir,path_split[3])+'/'
+			try:
+				sftp.mkdir(os.path.join(newdir,path_split[4]))
+			except IOError,e:
+				self.Log.logger.info("Remote directory %s already exists" % os.path.join(newdir,path_split[4]))
+				self.LogServer.info("Remote directory %s already exists" % os.path.join(newdir,path_split[4]))
+				self.Log.logger.error("Exception Class: %s" % e.__class__)
+			
+			newdir = os.path.join(newdir,path_split[4])+'/'
+			try:
+				sftp.mkdir(os.path.join(newdir,path_split[5]))
+			except IOError,e:
+				self.Log.logger.info("JP2 Remote directory %s already exists" % os.path.join(newdir,path_split[5]))
+				self.LogServer.info("JP2 Remote directory %s already exists" % os.path.join(newdir,path_split[5]))
+				self.Log.logger.error("Exception Class: %s" % e.__class__)
+			
+			newdir = os.path.join(newdir,path_split[5])+'/'
+			for fname in os.listdir(path):
+	                        try:
+	                        	self.Log.logger.warn("%s %s" % (os.path.normpath(path+"/"+fname)," ###"+os.path.normpath(newdir+"/"+fname)))
+	                        	self.LogServer.warn("%s %s" % (os.path.normpath(path+"/"+fname)," ###"+os.path.normpath(newdir+"/"+fname)))
+					sftp.put(os.path.normpath(path+"/"+fname),os.path.normpath(newdir+"/"+fname))
+					files_copied += 1
+                		except Exception,e:
+	                        	self.Log.logger.error("Error while copying file %s with error: %s" % (fname,e))
+	                        	self.LogServer.error("Error while copying file %s with error: %s" % (fname,e))
+					self.Log.logger.error("Exception Class: %s" % e.__class__)
+				self.Log.logger.info("File: %s" % fname)
+        	                if fname!='book.txt': postgresql_djatoka.append(os.path.normpath(newdir+"/"+fname))
+		
+			self.Log.logger.info("PostgreSQL-Djatoka Links: %s" % postgresql_djatoka)
+			self.LogServer.info("PostgreSQL-Djatoka Links: %s" % postgresql_djatoka)
+			ret_status = self.populate_postgresql_djatoka_db(postgresql_djatoka)
+			if ret_status == False:
+				self.Log.logger.error("Failed to populate database with new valid data")
+				self.LogServer.error("Failed to populate database with new valid data")
+			elif ret_status == True:
+				self.Log.logger.info("Populated database with new valid data successfully")
+				self.LogServer.info("Populated database with new valid data successfully")
+
+        	        dirlist = sftp.listdir(newdir)
+	                self.Log.logger.info("Dirlist: %s" % dirlist)
+	                self.LogServer.info("Dirlist: %s" % dirlist)
+			self.Log.logger.debug("Files copied %s %s" % (files_copied,len(dirlist)))
+			self.LogServer.debug("Files copied %s %s" % (files_copied,len(dirlist)))
+
+		self.Log.logger.debug("%s %s" % (src_dnames,dst_dname))
+		self.LogServer.debug("%s %s" % (src_dnames,dst_dname))
+		t.close()
+		return True		
+			
+				
+	def serve_forever(self):
+		self.registerExporterServer()
+		import paramiko
+		self.paramiko = paramiko
+		global RSA_Private_Key_Password
+		if not RSA_Private_Key_Password:
+			RSA_Private_Key_Password=None
+		while True:
+			# Scan Repository for completed/converted directories - Export them locally and remotely
+			dirs_2_move = []
+			alreadyConverted = self.scanRepository(MAIN_REPOSITORY)
+			for dname in alreadyConverted:
+				if self.checkSignature(os.path.join(dname,'done.sig')):
+					dirs_2_move.append(dname)
+			if len(dirs_2_move) > 0:
+				self.Log.logger.info(dirs_2_move)
+				#MOVE REMOTE DESTINATION - JP2 ONLY
+				if RemoteHost:
+					ret_status = self.move_toremotedestination(RemoteHost,RemotePort,SSHUser,RSA_Private_Key,RSA_Private_Key_Password,dirs_2_move,REMOTE_REPOSITORY)
+				#FIXME: handle it clearer
+				else:
+					ret_status = True
+				#MOVE LOCALLY, REMOVE png DIRECTORY
+				if ret_status == True:
+					self.move_locally(dirs_2_move,EXPORT_REPOSITORY)
+					try:
+						self.mailer.sendmail_report(dirs_2_move,MailerStates.TYPE_OK)
+					except Exception, e:
+						self.Log.logger.info("Cannot send email. Error: %s" % e)
+				elif ret_status == False:
+					self.Log.logger.error("Failed to export converted directories to remote host.")
+					try:
+						#FIXME: hardcoded emails <your email>
+						self.mailer.sendmail_custom("Export Failure",['<your email>'],"Failed to export converted directories to remote host.")
+					except Exception, e:
+						self.Log.logger.info("Cannot send email. Error: %s" % e)
+			elif len(dirs_2_move) == 0:
+				self.Log.logger.info("There are no converted directories.")
+				self.LogServer.info("There are no converted directories.")
+
+			failedConversion = self.scanForFailedConversions(MAIN_REPOSITORY)
+			if len(failedConversion) > 0:
+				try:
+					self.mailer.sendmail_report(failedConversion,MailerStates.TYPE_ERROR)
+				except Exception, e:
+					self.Log.logger.info("Cannot send email. Error: %s" % e)
+				for dname in failedConversion:
+					try:
+						mdir = dname.rsplit('/',1)[0]
+						dst_dir = FAILED_REPOSITORY+mdir.split(MAIN_REPOSITORY)[1]
+						self.Log.logger.info("Moving failed directory %s to %s" % (mdir,dst_dir))
+						shutil.move(mdir,dst_dir)
+					except shutil.Error:
+						self.Log.logger.error("Cannot move failed directory %s to %s" % (mdir,FAILED_REPOSITORY))
+						try:
+							self.mailer.sendmail_custom("Move Failure for Failed Directory",['<your email>'],"Moving failed directory %s to %s failed." % (mdir,dst_dir))
+						except Exception, e:
+							self.Log.logger.info("Cannot send email. Error: %s" % e)
+					except:
+						self.Log.logger.error("Cannot move failed directory %s. Unhandled exception" % mdir)
+						try:
+							self.mailer.sendmail_custom("Move Failure for Failed Directory",['<your email>'],"Moving failed directory %s to %s failed. Unhandled Exception." % (mdir,dst_dir))
+						except Exception, e:
+							self.Log.logger.info("Cannot send email. Error: %s" % e)
+			elif len(failedConversion) == 0:
+				self.Log.logger.info("There are no failed directories.")
+				self.LogServer.info("There are no failed directories.")
+			#self.Log.logger.info("DONE: %s" % dirs_2_move)
+			time.sleep(60)
+
+class DistillerExporterStatus(threading.Thread):
+        def __init__(self):
+                threading.Thread.__init__(self)
+        def run(self):
+                self.context = zmq.Context()
+                self.status = self.context.socket(zmq.REP)
+                self.status.bind(EXPORTER_STATUS_ENDPOINT)
+                self.poller = zmq.Poller()
+                self.poller.register(self.status,zmq.POLLIN)
+                self.Log = DistillerLogger(EXPORTER_LOG_FILE,"DistillerExporterStatus")
+                while True:
+                        if self.poller.poll(100):
+                                try:
+                                        msg = self.status.recv()
+                                        if msg == States.D_GETSTATUS:
+                                                self.status.send(States.D_OK)
+                                except Exception, e:
+                                        self.Log.logger.error("Error while trying to send ACK heartbeat: %s" % e)
+
+
+class DistillerExporterServer(object):
+	def __init__(self):
+		self.stdin_path = '/dev/null'
+                self.stdout_path = '/dev/null'
+                self.stderr_path = '/dev/null'
+                self.pidfile_path =  EXPORTER_PID_FILE
+                self.pidfile_timeout = 5
+	def run(self):
+		statusPublisher = DistillerExporterStatus()
+                statusPublisher.setDaemon(True)
+                statusPublisher.start()	
+		Exporter = DistillerExporter()
+		Exporter.serve_forever()
+
+
+
+if __name__ == "__main__":
+	
+	optparser = optparse.OptionParser(usage=usage,version=version)
+        (options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+	
+	if len(args) == 0:
+                optparser.print_help()
+                sys.exit(-1)
+
+	if args[0] == 'start':
+                if not os.path.exists(EXPORTER_PID_FILE):
+                        server = DistillerExporterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+                else:
+                        print "PID File exists: %s" % EXPORTER_PID_FILE
+        elif args[0] == 'stop':
+                if os.path.exists(EXPORTER_PID_FILE):
+                        server = DistillerExporterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._stop()
+                else:
+                        print "Exporter server is not running."
+        elif args[0] == 'restart':
+                if os.path.exists(EXPORTER_PID_FILE):
+                        server = DistillerExporterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._restart()
+                else:
+                        server = DistillerExporterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+        elif args[0] == 'status':
+                if os.path.exists(EXPORTER_PID_FILE):
+                        fd = open(EXPORTER_PID_FILE,'r')
+                        pid = fd.readlines()[0].strip()
+                        fd.close()
+                        print "Exporter server is running, PID: %s" % pid
+                else:
+                        print "Exporter server is not running"
+	elif args[0] == 'log':
+		setproctitle.setproctitle(sys.argv[0]+" "+args[0])
+                log = DistillerTailLog(EXPORTER_LOG_FILE)
+                log.follow()
+	elif args[0] == 'foreground':
+		Exporter = DistillerExporter()
+		Exporter.serve_forever()
+        else:
+                optparser.print_help()
+                sys.exit(-1)
+
+
+

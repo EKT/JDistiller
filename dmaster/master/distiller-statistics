@@ -1,0 +1,445 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import sqlite3
+import uuid
+import datetime
+import threading
+import time
+import optparse
+import os
+import os.path
+import sys
+import signal
+from daemon import runner
+import logging
+import platform
+import glob
+import cPickle
+from datetime import datetime
+import threading
+import pymongo
+from Queue import Queue
+import setproctitle
+import ConfigParser
+# jp2k-distiller Modules
+from dutils import ColorAttr,States,Services,DistillerLogger,DistillerTailLog,DistillerLoggerServer
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log       watch server's logfile (enable DEBUG mode)
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log       # watch daemon's logfile (enable DEBUG mode)
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+DEBUG_ = True
+SERVICE_NAME = "distiller-statistics"
+_conffile='distiller_master.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+MASTER_SERVER_ENDPOINT=config.get("STATISTICS","MasterServerEndpoint")
+STATS_SERVER_STATUS_ENDPOINT=config.get("STATISTICS","StatsServerStatusEndpoint")
+STATS_SERVER_ENDPOINT=config.get("STATISTICS","StatsServerEndpoint")
+STATS_PID_FILE=config.get("STATISTICS","StatsPIDFile")
+STATS_LOG_FILE=config.get("STATISTICS","StatsLOGFile")
+EXPORT_REPOSITORY = config.get("EXPORTER","ExportRepository")
+MongoDB_Server = config.get("STATISTICS","MongoDBServer")
+MongoDB_Username = config.get("STATISTICS","MongoDBUsername")
+MongoDB_Password = config.get("STATISTICS","MongoDBPassword")
+
+triggerQueue = Queue()
+
+class DistillerStatistics(object):
+	def __init__(self,master_endpoint=MASTER_SERVER_ENDPOINT,stats_endpoint=STATS_SERVER_ENDPOINT):
+		self.master_endpoint = master_endpoint
+		self.stats_endpoint = stats_endpoint
+		self.Log = DistillerLogger(STATS_LOG_FILE,"DistillerStatisticsDaemon")
+		self.LogServer = DistillerLoggerServer("tcp://0.0.0.0:5003","DistillerStatistics") #FIXME: Hardcoded
+
+	def createContext(self):
+		self.context = zmq.Context()
+		self.stats_server = self.context.socket(zmq.REP)
+		self.stats_server.bind(self.stats_endpoint)
+		self.registerStatisticsService()
+
+	def registerStatisticsService(self):
+		self.register_service = self.context.socket(zmq.REQ)
+                self.register_service.connect(self.master_endpoint)
+                self.register_service.send(States.D_REGISTER)
+                msg = self.register_service.recv()
+                if msg == States.D_TRY:
+                        self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"Statistics Server","SERVER":platform.node()})))
+                        reg_status = self.register_service.recv()
+                        if reg_status == States.D_REGISTERED:
+                                self.Log.logger.info("Registered to master server")
+                                self.LogServer.info("Registered to master server")
+                        elif reg_status == States.D_REG_ERROR:
+                                self.Log.logger.error("Cannot register to master server")
+                                self.LogServer.error("Cannot register to master server")
+                                sys.exit(2)
+                        self.register_service.close()
+                        del self.register_service
+                elif msg != States.D_TRY:
+                        self.Log.logger.error("Message error.Cannot register to master server.")
+                        sys.exit(2)
+
+	def find_dps_files(self,directory):
+		# Return a list([]) with all dps file in directory
+		return glob.glob1(directory,"*.dps")
+
+	def retrieve_statistics(self,fname):
+		return cPickle.load(open(fname,"rb"))
+
+	def connect_and_store_to_mongodb(self,statistics_data):
+		try:
+			conn = pymongo.Connection(MongoDB_Server)
+			db = conn.dpool_cluster_dmaster
+			db.statistics.insert(statistics_data)
+		except Exception, e:
+			self.Log.logger.error("MongoDB Error: %s" % e)
+			return False
+		
+		return True
+
+	def run(self):
+		statusPublisher = DistillerStatisticsStatus()
+                statusPublisher.setDaemon(True)
+                statusPublisher.start()
+		self.createContext()
+		statisticsMongoDBupdater = DistillerUpdateMongoStatistics()
+		statisticsMongoDBupdater.setDaemon(True)
+		statisticsMongoDBupdater.start()
+		# FIXME - New thread to monitor connectivity with MongoDB - If connectivity fails don't
+		# add new directory to MongoDB - Keep database with failed or unprocessed directories
+		#
+		self.serve_forever()
+		
+	def serve_forever(self):
+		while True:
+			directory = self.stats_server.recv_pyobj()
+			# ACK message
+			self.stats_server.send(States.D_ACK_DIR)
+			# FIXME - Check if MongoDB server is up and running - If not save directory to failed and wait for next message
+			# Check if directory exists
+			self.Log.logger.info(directory)
+			dps_files = None
+			if os.path.exists(directory):
+				dps_files = self.find_dps_files(directory)
+			else:
+				self.Log.logger.error("Directory %s does not exist" % directory)
+				self.LogServer.error("Directory %s does not exist" % directory)
+				continue
+			self.Log.logger.info(dps_files)
+			if dps_files is not None:
+				for fname in dps_files:
+					statistics_data = None
+					total_conv_files = None
+					ret_status = None
+					if os.path.isfile(os.path.join(directory,fname)):
+						statistics_data = self.retrieve_statistics(os.path.join(directory,fname))
+					if os.path.isdir(os.path.join(directory,fname.replace("dps","jp2"))):
+						fd = open(os.path.join(directory,fname.replace("dps","jp2"))+"/book.txt","r")
+						total_conv_files = fd.readline().strip()
+						fd.close()
+					else:
+						self.Log.logger.error("Directory %s does not exist" % os.path.join(directory,fname.replace("dps","jp2")))
+						self.LogServer.error("Directory %s does not exist" % os.path.join(directory,fname.replace("dps","jp2")))
+					if statistics_data is not None and total_conv_files is not None:
+						statistics_data["totalfiles"] = total_conv_files
+						statistics_data["dpsfile"] = os.path.join(directory,fname)
+						# Connect to MongoDB Server -  Store Message
+						ret_status = self.connect_and_store_to_mongodb(statistics_data)
+						del statistics_data
+					else:
+						self.Log.logger.error("Cannot retrieve statistics data and/or total converted files for directory %s" % os.path.join(directory,fname.replace("dps","jp2")))
+						self.LogServer.error("Cannot retrieve statistics data and/or total converted files for directory %s" % os.path.join(directory,fname.replace("dps","jp2")))
+						# Store failed directory in local database - distiller_master.db - Statistics Table or Stats_Failed table
+						# ACK if everything worked fine - Emit ERROR if something went wrong
+						# Exporter has already moved Directory - Send Email for Error - Try again later(Keep failed directories in Database) - Find error
+						continue
+					if ret_status is True:
+						self.Log.logger.info("Statistics for directory %s has been filed" % os.path.join(directory,fname.replace("dps","jp2")))
+						self.LogServer.info("Statistics for directory %s has been filed" % os.path.join(directory,fname.replace("dps","jp2")))
+						# RENAME dps file to *.dps.done
+						try:
+							os.rename(os.path.join(directory,fname),os.path.join(directory,fname.replace("dps","dps.done")))
+						except Exception, e:
+							self.Log.logger.error("Cannot rename dps file %s. Error: %s" % (os.path.join(directory,fname),e))
+							self.LogServer.error("Cannot rename dps file %s. Error: %s" % (os.path.join(directory,fname),e))
+				triggerQueue.put("triggermsg")
+			else:
+				self.Log.logger.error("No dps file in directory: %s" % directory)
+				self.LogServer.error("No dps file in directory: %s" % directory)
+			del directory; del dps_files
+			# New thread to manage failed directories or handle them here - Poll for INCOMING messages if not handle failed messages - If thousand BIG LATENCY - Better handle it in separate thread
+			# here in
+
+class DistillerUpdateMongoStatistics(threading.Thread):
+	def __init__(self):
+		threading.Thread.__init__(self)
+
+	def run(self):
+		from bson.code import Code
+                self.Log = DistillerLogger(STATS_LOG_FILE,"DistillerUpdateMongoStatistics")
+		self.LogServer = DistillerLoggerServer("tcp://0.0.0.0:5003","DistillerUpdateMongoStatistics")
+		self.Months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+		self.mapf = Code("function () { \
+                		emit(this.node,{totalconvertedpages: this.totalfiles}); \
+		           	}")
+		self.reducef = Code("function(key,values){ \
+                		var count=0;  \
+		                values.forEach(function(v) { \
+		                count += parseInt(v['totalconvertedpages']); \
+		                }); \
+		                return {totalconvertedpages: count}; \
+		                }")
+		self.mapf_files = Code("function () { \
+		                emit(this.node,{totalconvertedfiles: 1}); \
+		           	}")
+		# Use count for each node 
+		self.reducef_files = Code("function(key,values){ \
+		                var count=0;  \
+		                values.forEach(function(v) { \
+		                count += v.totalconvertedfiles; \
+		                }); \
+		                return {totalconvertedfiles: count}; \
+		                }")
+		self.map_meantime_totalfiles =  Code("function () { \
+		                emit(this.node,{totalfiles: count=1, pdftime: this.pdf2png, jp2time: this.png2jp2, tifftime: this.tiff2jp2}); \
+			        }")
+		self.reduce_meantime_totalfiles = Code("function(key,values){ \
+		                var count=parseInt(0);  var pdftotaltime=parseInt(0); var jp2totaltime=parseInt(0); var tifftotaltime=parseInt(0);\
+				var pdfcount=parseInt(0); var jp2count=parseInt(0); var tiffcount=parseInt(0); \
+		                values.forEach(function(v) { \
+		                count += parseInt(1); \
+		                if(v['pdftime'] == null) \
+		                { \
+		                        pdftotaltime += parseInt(0);\
+		                }else{\
+		                        pdftotaltime += parseInt(v['pdftime'].split(':')[0])*3600 + parseInt(v['pdftime'].split(':')[1])*60+parseInt(v['pdftime'].split(':')[2].split('.')[0]); \
+		                	pdfcount += parseInt(1); \
+		                }\
+		                if(v['jp2time'] == null)\
+		                {\
+		                        jp2totaltime+=parseInt(0);\
+		                }else{\
+		                        jp2totaltime += parseInt(v['jp2time'].split(':')[0])*3600 + parseInt(v['jp2time'].split(':')[1])*60+parseInt(v['jp2time'].split(':')[2].split('.')[0]); \
+		                	jp2count += parseInt(1); \
+		                }\
+		                if(v['tifftime'] == null)\
+		                { \
+		                        tifftotaltime+=parseInt(0); \
+		                }else{ \
+			                tifftotaltime += parseInt(v['tifftime'].split(':')[0])*3600 + parseInt(v['tifftime'].split(':')[1])*60+parseInt(v['tifftime'].split(':')[2].split('.')[0]); \
+		                	tiffcount += parseInt(1); \
+		                }\
+		                }); \
+				if(pdfcount == 0) { \
+					pdfcount = parseInt(1); \
+				}\
+				if(jp2count == 0) { \
+					jp2count = parseInt(1); \
+				}\
+				if(tiffcount == 0) { \
+					tiffcount = parseInt(1); \
+				}\
+		                return {pdf2png_meantime_per_file: parseFloat((pdftotaltime/pdfcount).toFixed(4)), png2jp2_meantime_per_file: parseFloat((jp2totaltime/jp2count).toFixed(4)), tiff2jp2_meantime_per_file: parseFloat((tifftotaltime/tiffcount).toFixed(4))}; \
+		                }")
+		self.map_meantime_totalpages =  Code("function () { \
+		                emit(this.node,{totalfiles: this.totalfiles, pdftime: this.pdf2png, jp2time: this.png2jp2, tifftime: this.tiff2jp2}); \
+			        }")
+		self.reduce_meantime_totalpages = Code("function(key,values){ \
+		                var count=0;  var pdftotaltime=0; var jp2totaltime=0; var tifftotaltime=0;\
+				var pdfcount=0; var jp2count=0; var tiffcount=0; \
+		                values.forEach(function(v) { \
+		                count += parseInt(v['totalfiles']); \
+		                if(v['pdftime'] == null) \
+		                { \
+		                        pdftotaltime += 0;\
+		                }else{\
+		                        pdftotaltime += parseInt(v['pdftime'].split(':')[0])*3600 + parseInt(v['pdftime'].split(':')[1])*60+parseInt(v['pdftime'].split(':')[2].split('.')[0]); \
+		                	pdfcount += parseInt(v['totalfiles']); \
+		                }\
+		                if(v['jp2time'] == null)\
+		                {\
+		                        jp2totaltime+=0;\
+		                }else{\
+		                        jp2totaltime += parseInt(v['jp2time'].split(':')[0])*3600 + parseInt(v['jp2time'].split(':')[1])*60+parseInt(v['jp2time'].split(':')[2].split('.')[0]); \
+		                	jp2count += parseInt(v['totalfiles']); \
+		                }\
+		                if(v['tifftime'] == null)\
+		                { \
+		                        tifftotaltime+=0; \
+		                }else{ \
+			                tifftotaltime += parseInt(v['tifftime'].split(':')[0])*3600 + parseInt(v['tifftime'].split(':')[1])*60+parseInt(v['tifftime'].split(':')[2].split('.')[0]); \
+		                	tiffcount += parseInt(v['totalfiles']); \
+		                }\
+		                }); \
+				if(pdfcount == 0) { \
+					pdfcount = 1; \
+				}\
+				if(jp2count == 0) { \
+					jp2count = 1; \
+				}\
+				if(tiffcount == 0) { \
+					tiffcount = 1; \
+				}\
+		                return {pdf2png_meantime_per_page: parseFloat((pdftotaltime/pdfcount).toFixed(4)), png2jp2_meantime_per_page: parseFloat((jp2totaltime/jp2count).toFixed(4)), tiff2jp2_meantime_per_page: parseFloat((tifftotaltime/tiffcount).toFixed(4))}; \
+		                }")
+ 		self.db = pymongo.Connection(MongoDB_Server).dpool_cluster_dmaster
+		while True:
+			triggermsg = triggerQueue.get()
+			self.Log.logger.debug("Start populating new statistics")
+			for i in range(0,12):
+			        if i<11:
+			                start=datetime(datetime.now().year,i+1,1)
+			                end=datetime(datetime.now().year,i+2,1)
+			        else:
+			                start=datetime(datetime.now().year,i+1,1)
+			                end=datetime(datetime.now().year+1,1,1)
+			        result = self.db.statistics.find({"creationdate":{"$gte": start, "$lt": end}})
+			        for post in result:
+			                self.db[self.Months[i]+'_'+str(datetime.now().year)+'_temp'].insert(post)
+				del result
+			for i in range(0,12):
+			        try:
+			                self.db[self.Months[i]+'_'+str(datetime.now().year)+'_temp'].map_reduce(self.mapf,self.reducef,out=str(self.Months[i]+'_'+str(datetime.now().year)+'_totalpages'))
+			                #self.db[self.Months[i]+'_'+str(datetime.now().year)+'_temp'].drop()
+			        except Exception, e:
+			                continue
+			for i in range(0,12):
+			        try:
+			                self.db[self.Months[i]+'_'+str(datetime.now().year)+'_temp'].map_reduce(self.mapf_files,self.reducef_files,out=str(self.Months[i]+'_'+str(datetime.now().year)+'_totalfiles'))
+			                self.db[self.Months[i]+'_'+str(datetime.now().year)+'_temp'].drop()
+			        except Exception, e:
+					print e
+			                continue
+			self.db.statistics.map_reduce(self.map_meantime_totalfiles, self.reduce_meantime_totalfiles, out="meantime_for_totalfiles")
+			self.Log.logger.info("Updated MongoDB statistics (Map/Reduce #1,#2)")
+			self.LogServer.info("Updated MongoDB statistics (Map/Reduce #1,#2)")
+			self.db.statistics.map_reduce(self.map_meantime_totalpages, self.reduce_meantime_totalpages, out="meantime_for_totalpages")
+			self.Log.logger.info("Updated MongoDB statistics (Map/Reduce #3,#4)")
+			self.LogServer.info("Updated MongoDB statistics (Map/Reduce #3,#4)")
+			time.sleep(10)
+ 
+
+class DistillerStatisticsStatus(threading.Thread):
+        def __init__(self):
+                threading.Thread.__init__(self)
+        def run(self):
+                self.context = zmq.Context()
+                self.status = self.context.socket(zmq.REP)
+                self.status.bind(STATS_SERVER_STATUS_ENDPOINT)
+                self.poller = zmq.Poller()
+                self.poller.register(self.status,zmq.POLLIN)
+                self.Log = DistillerLogger(STATS_LOG_FILE,"DistillerStatisticsStatus")
+                while True:
+                        if self.poller.poll(100):
+                                try:
+                                        msg = self.status.recv()
+                                        if msg == States.D_GETSTATUS:
+                                        	self.status.send(States.D_OK)
+				except Exception, e:
+					self.Log.logger.error("Error while trying to send ACK heartbeat: %s" % e)
+
+
+
+class DistillerStatisticsServer(object):
+	def __init__(self):
+	        self.stdin_path = '/dev/null'
+	        self.stdout_path = '/dev/null'
+	        self.stderr_path = '/dev/null'
+	        self.pidfile_path =  STATS_PID_FILE
+	        self.pidfile_timeout = 5
+	def run(self):
+		StatisticsServer = DistillerStatistics()
+		StatisticsServer.run()
+		
+
+if __name__ == "__main__":
+
+	optparser = optparse.OptionParser(usage=usage,version=version)
+	(options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+
+		
+	if len(args) == 0:
+	        optparser.print_help()
+	        sys.exit(-1)
+
+	if args[0] == 'start':
+		if not os.path.exists(STATS_PID_FILE):
+			server = DistillerStatisticsServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._start()
+		else:
+			print "PID File exists: %s" % STATS_PID_FILE
+	elif args[0] == 'stop':
+		if os.path.exists(STATS_PID_FILE):
+			server = DistillerStatisticsServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._stop()
+		else:
+			print "Statistics server is not running."
+	elif args[0] == 'restart':
+		if os.path.exists(STATS_PID_FILE):
+			server = DistillerStatisticsServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._restart()
+		else:
+			server = DistillerStatisticsServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._start()
+	elif args[0] == 'status':
+		if os.path.exists(STATS_PID_FILE):
+			fd = open(STATS_PID_FILE,'r')
+			pid = fd.readlines()[0].strip()
+			fd.close()
+			print "Statistics server is running, PID: %s" % pid
+		else:
+			print "Statistics server is not running"
+	elif args[0] == 'log':
+		setproctitle.setproctitle(sys.argv[0]+" "+args[0])
+                log = DistillerTailLog(STATS_LOG_FILE)
+		if len(args) == 2: log.tail(int(args[1])) 
+                log.follow()
+	elif args[0] == 'foreground':
+		StatisticsServer = DistillerStatistics()
+		StatisticsServer.run()
+	else:
+	        optparser.print_help()
+	        sys.exit(-1)

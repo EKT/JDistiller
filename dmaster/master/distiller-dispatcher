@@ -1,0 +1,339 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import time
+import sqlite3
+import optparse
+import os
+import os.path
+import sys
+import signal
+import logging
+import platform
+import re
+import itertools
+import threading
+from daemon import runner
+import fnmatch
+import setproctitle
+import ConfigParser
+# jp2k-distiller Modules
+from dutils import DistillerLogger,States,DistillerTailLog,DistillerLoggerServer
+from dutils import DistillerMailer,MailerStates
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log       watch server daemon logfile
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log	  # watch daemon's logfile
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+
+DEBUG_ = False
+SERVICE_NAME="distiller-dispatcher"
+_conffile='distiller_master.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+
+DISPATCHER_SERVER_ENDPOINT = config.get("DISPATCHER","DispatcherServerEndpoint")
+DISPATCHER_LOG_FILE = config.get("DISPATCHER","DispatcherLogFile")
+MASTER_ENDPOINT = config.get("DISPATCHER","MasterServerEndpoint")
+DISPATCHER_STATUS_ENDPOINT = config.get("DISPATCHER","DispatcherStatusEndpoint")
+DISPATCHER_PID_FILE = config.get("DISPATCHER","DispatcherPIDFile")
+MASTER_DATABASE = os.getcwd()+'/distiller_master.db'
+
+# MAIN CONVERSION REPOSITORY 
+MAIN_REPOSITORY = config.get("EXPORTER","LocalRepository")
+PDF_REPOSITORY = config.get("EXPORTER","PdfConversionRepository").split(",")
+
+class DistillerDispatcher(object):
+	def __init__(self,dispatcher_endpoint=DISPATCHER_SERVER_ENDPOINT,master_endpoint=MASTER_ENDPOINT):
+		self.dispatcher_endpoint = dispatcher_endpoint
+		self.master_endpoint = master_endpoint
+		self.Log = DistillerLogger(DISPATCHER_LOG_FILE,"DistillerDispatcher")
+		self.LogServer = DistillerLoggerServer("tcp://0.0.0.0:5003","DistillerDispatcher") #FIXME: Hardcoded
+
+	def registerDispatcherServer(self):
+		self.register_service = self.context.socket(zmq.REQ)
+		self.register_service.connect(self.master_endpoint)
+                self.register_service.send("REGISTER")
+                msg = self.register_service.recv()
+                if msg == States.D_TRY:
+			self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"Dispatch Server","SERVER":platform.node()})))
+			reg_status = self.register_service.recv()
+			if reg_status == States.D_REGISTERED:
+				self.Log.logger.info("Registered to master server")
+			elif reg_status == States.D_ERR_REGISTERED:
+				self.Log.logger.info("Cannot register to master server")
+				sys.exit(2)
+			self.register_service.close()
+			del self.register_service
+		elif msg != States.D_TRY:
+			self.Log.logger.info("Message error.Cannot register to master server.")
+                        sys.exit(2)
+
+	def createContext(self):
+		self.context = zmq.Context()
+		#self.dispatcher = self.context.socket(zmq.PUSH)
+		self.dispatcher = self.context.socket(zmq.PUB)
+		self.dispatcher.bind(self.dispatcher_endpoint)
+	
+	def hasbeenconverted(self,path):
+		for dirnames in os.listdir(path):
+			if os.path.isdir(os.path.join(path,dirnames)):
+				if fnmatch.fnmatch(os.path.join(path,dirnames),"*.jp2") or fnmatch.fnmatch(os.path.join(path,dirnames),"*.png"):
+					return True
+
+
+	def scanRepository(self,repository_dir):
+		non_converted_dirnames = []
+		for path,dirs,files in os.walk(repository_dir):
+			for file in files:
+				if fnmatch.fnmatch(file.lower(),"*.pdf") or fnmatch.fnmatch(file.lower(),"*.tif") or fnmatch.fnmatch(file.lower(),"*.tiff") or fnmatch.fnmatch(file.lower(),"*.jpg") or fnmatch.fnmatch(file.lower(),"*.jpeg"):
+					if not self.hasbeenconverted(path):
+						non_converted_dirnames.append(path)
+						try:
+							os.mkdir(path+"/"+"dlock.jp2")
+						except:
+							self.Log.logger.info("Cannot create lock directory in %s" % path)
+		return non_converted_dirnames
+	
+	def scanExportedRepository(self,repository_dir):
+		non_converted_dirnames = []
+		for path,dirs,files in os.walk(repository_dir):
+			for dir in dirs:
+				if fnmatch.fnmatch(dir.lower(),"dlock.pdf"):
+					non_converted_dirnames.append(path)
+					os.rename(path+"/dlock.pdf",path+"/dlock.pdf.send")
+		return non_converted_dirnames
+					
+	
+	def serve_forever(self):
+		self.registerDispatcherServer()
+		
+		statusPublisher = DistillerDispatcherStatus()
+                statusPublisher.setDaemon(True)
+                statusPublisher.start()
+		
+		self.master = self.context.socket(zmq.REQ)
+                self.master.connect(self.master_endpoint)
+		self.poller = zmq.Poller()
+		self.poller.register(self.master, zmq.POLLIN)
+		while True:
+			# Check if master is up, then continue.
+			# If master is down then the database is not updated
+			# with the latest status of nodes
+			# Do not dispatch anything
+			try:
+	                	self.master.send(States.D_PING)
+				if self.poller.poll(1000):
+			                msg = self.master.recv()
+					if msg == States.D_PONG:
+						self.Log.logger.debug(msg)
+						if self.LogServer.debug("Master Server is running") == False:
+							self.Log.logger.error("Message delivery error to LogServer.")
+						pass
+					elif msg != States.D_PONG:
+						self.Log.logger.error("Wrong message from master server %s, %s" % (self.master_endpoint,msg))
+						time.sleep(10)
+						continue
+					del msg
+				else:
+					self.Log.logger.error("distiller-master service is down.")
+					time.sleep(10)
+					continue
+			except Exception, e:
+				self.Log.logger.error("Cannot communicate with master server %s" % self.master_endpoint)
+				self.Log.logger.error("Error %s" % e)
+				time.sleep(10)
+				try:
+					self.master.close()
+					self.master = self.context.socket(zmq.REQ)
+					self.master.connect(self.master_endpoint)
+					del self.poller
+					self.poller = zmq.Poller()
+					self.poller.register(self.master, zmq.POLLIN)
+				except Exception, e:
+					self.Log.logger.error("Error. Trying to reconnect to master server: %s" % e)
+				continue
+
+			#msg = "msg"
+			#self.dispatcher.send(json.dumps(dict({"SERVER":"shadow","URL":msg})))
+			# If nonbusy_nodes exist then scan repository
+			try:
+				nonbusy_nodes = []
+				conn = sqlite3.connect(MASTER_DATABASE)
+				cursor = conn.cursor()
+				query = "SELECT uuid,hostname from nonbusy_nodes"
+				for row in cursor.execute(query):
+					if row[1] is not None:
+						nonbusy_nodes.append(str(row[1]))
+			except sqlite3.Error,e:
+				self.Log.logger.error("Error %s" % e.args[0])
+			finally:
+				if conn:
+					conn.close()
+					del conn; del cursor; del query
+
+			if len(nonbusy_nodes) > 0:
+					largeobject = list(set(self.scanRepository(MAIN_REPOSITORY)))
+					verylargeobject = list()
+					for dir in PDF_REPOSITORY:
+						verylargeobject += self.scanExportedRepository(dir)
+					free_nodes = itertools.cycle(nonbusy_nodes)
+					if len(largeobject) > 0:
+						while len(largeobject) > 0:
+							chunk = largeobject.pop()
+							routing_msg = {"SERVER":free_nodes.next(),"URL":chunk,"METHOD":"TO_JP2"}
+							self.dispatcher.send_pyobj(routing_msg)
+							if DEBUG_: self.Log.logger.info(routing_msg)
+							del routing_msg; del chunk
+						
+						for slave_server in nonbusy_nodes:
+							self.dispatcher.send_pyobj({"SERVER":slave_server,"URL":States.D_FIREUP,"METHOD":"TO_JP2"})
+							if DEBUG_: self.Log.logger.info({"SERVER":slave_server,"URL":States.D_FIREUP,"METHOD":"TO_JP2"})
+					elif len(verylargeobject) > 0:
+						while len(verylargeobject) > 0:
+							print verylargeobject
+							chunk = verylargeobject.pop()
+							routing_msg = {"SERVER":free_nodes.next(),"URL":chunk,"METHOD":"TO_PDF"}
+							self.dispatcher.send_pyobj(routing_msg)
+							if DEBUG_: self.Log.logger.info(routing_msg)
+							del routing_msg; del chunk
+						
+						for slave_server in nonbusy_nodes:
+							self.dispatcher.send_pyobj({"SERVER":slave_server,"URL":States.D_FIREUP,"METHOD":"TO_PDF"})
+							if DEBUG_: self.Log.logger.info({"SERVER":slave_server,"URL":States.D_FIREUP,"METHOD":"TO_PDF"})
+			else:
+				self.Log.logger.info("There are zero nonbusy nodes")
+			del nonbusy_nodes
+			# Retrieve nonbusy_nodes (SQLITE) and do_scheduling - RoundRobin Algorithm - Send to each active node one directory - Loop until the list ends - Lock until 
+			# the process has ended - When converter finishes notice master that the node is not BUSY - SLAVE have GET_STATUS and GET_WORK_STATUS -> states: Busy,NBusy
+			time.sleep(10)
+
+class DistillerDispatcherStatus(threading.Thread):
+        def __init__(self):
+                threading.Thread.__init__(self)
+        def run(self):
+                self.context = zmq.Context()
+                self.status = self.context.socket(zmq.REP)
+                self.status.bind(DISPATCHER_STATUS_ENDPOINT)
+                self.poller = zmq.Poller()
+                self.poller.register(self.status,zmq.POLLIN)
+                self.Log = DistillerLogger(DISPATCHER_LOG_FILE,"DistillerDispatcherStatus")
+                while True:
+                        if self.poller.poll(100):
+                                try:
+                                        msg = self.status.recv()
+                                        if msg == States.D_GETSTATUS:
+                                                self.status.send(States.D_OK)
+                                except Exception, e:
+                                        self.Log.logger.error("Error while trying to send ACK heartbeat: %s" % e)
+
+
+
+
+class DistillerDispatcherServer(object):
+	def __init__(self):
+		self.stdin_path = '/dev/null'
+                self.stdout_path = '/dev/null'
+                self.stderr_path = '/dev/null'
+                self.pidfile_path =  DISPATCHER_PID_FILE
+                self.pidfile_timeout = 5
+	def run(self):
+		Dispatcher = DistillerDispatcher()
+		Dispatcher.createContext()
+		Dispatcher.serve_forever()
+
+
+
+if __name__ == "__main__":
+	
+	optparser = optparse.OptionParser(usage=usage,version=version)
+        (options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+
+	if len(args) == 0:
+                optparser.print_help()
+                sys.exit(-1)
+
+	if args[0] == 'start':
+                if not os.path.exists(DISPATCHER_PID_FILE):
+                        server = DistillerDispatcherServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+                else:
+                        print "PID File exists: %s" % DISPATCHER_PID_FILE
+        elif args[0] == 'stop':
+                if os.path.exists(DISPATCHER_PID_FILE):
+                        server = DistillerDispatcherServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._stop()
+                else:
+                        print "Dispatcher server is not running."
+        elif args[0] == 'restart':
+                if os.path.exists(DISPATCHER_PID_FILE):
+                        server = DistillerDispatcherServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._restart()
+                else:
+                        server = DistillerDispatcherServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+        elif args[0] == 'status':
+                if os.path.exists(DISPATCHER_PID_FILE):
+                        fd = open(DISPATCHER_PID_FILE,'r')
+                        pid = fd.readlines()[0].strip()
+                        fd.close()
+                        print "Dispatcher server is running, PID: %s" % pid
+                else:
+                        print "Dispatcher server is not running"
+	elif args[0] == 'log':
+		setproctitle.setproctitle(sys.argv[0]+" "+args[0])
+                log = DistillerTailLog(DISPATCHER_LOG_FILE)
+                log.follow()
+	elif args[0] == 'foreground':
+		Dispatcher = DistillerDispatcher()
+		Dispatcher.createContext()
+		Dispatcher.serve_forever()
+        else:
+                optparser.print_help()
+                sys.exit(-1)
+
+
+
+	

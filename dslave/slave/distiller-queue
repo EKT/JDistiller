@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import platform
+import threading
+import sys
+import os
+import optparse
+from daemon import runner
+import ConfigParser
+import setproctitle
+#jp2k-distiller modules
+from dutils import DistillerLogger,DistillerTailLog,States
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log	    watch server daemon logfile
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log	  # watch daemon's logfile
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+SERVICE_NAME='distiller-queue'
+# Configuration file
+_conffile='distiller_slave.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+MASTER_HOSTNAME = config.get("MASTER","Hostname")
+
+MASTER_ENDPOINT = "tcp://"+MASTER_HOSTNAME+":5001"
+QUEUE_ENDPOINT = config.get("QUEUE","Endpoint")
+QUEUE_STATUS_ENDPOINT = config.get("QUEUE","StatusEndpoint")
+QUEUE_LOG_FILE = config.get("QUEUE","LogFile")
+QUEUE_PID_FILE = config.get("QUEUE","PidFile")
+CONVERTER_IPC_ENDPOINT = config.get("CONVERTER","Endpoint")
+PDFCONVERTER_IPC_ENDPOINT = config.get("PDFCONVERTER","Endpoint")
+
+class DistillerQueue(object):
+	def __init__(self,queue_ipc_endpoint=QUEUE_ENDPOINT,master_endpoint=MASTER_ENDPOINT,converter_ipc_endpoint=CONVERTER_IPC_ENDPOINT, pdfconverter_ipc_endpoint=PDFCONVERTER_IPC_ENDPOINT):
+		self.queue_ipc_endpoint = queue_ipc_endpoint
+		self.master_endpoint = master_endpoint
+		self.converter_ipc_endpoint = converter_ipc_endpoint
+		self.pdfconverter_ipc_endpoint = pdfconverter_ipc_endpoint
+                self.Log = DistillerLogger(QUEUE_LOG_FILE,"DistillerQueue")
+
+
+	def registerQueueService(self):
+		self.register_service = self.context.socket(zmq.REQ)
+		self.register_service.connect(self.master_endpoint)
+		self.register_service.send(States.D_REGISTER)
+                msg = self.register_service.recv()
+                if msg == States.D_TRY:
+			self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"Queue","SERVER":platform.node()})))
+			reg_status = self.register_service.recv()
+			if reg_status == States.D_REGISTERED:
+				self.Log.logger.info("Registered to master server")
+			elif reg_status == States.D_REG_ERROR:
+				self.Log.logger.info("Cannot register to master server")
+				sys.exit(2)
+			self.register_service.close()
+			del self.register_service
+		elif msg != States.D_TRY:
+                        self.Log.logger.info("Message error.Cannot register to master server.")
+                        sys.exit(2)
+
+	def createContext(self):
+		self.context = zmq.Context()
+		self.queue = self.context.socket(zmq.PULL)
+		self.queue.connect(self.queue_ipc_endpoint)
+		self.conv = self.context.socket(zmq.PUSH)
+		self.conv.bind(self.converter_ipc_endpoint)
+		self.pdfconv = self.context.socket(zmq.PUSH)
+		self.pdfconv.bind(self.pdfconverter_ipc_endpoint)
+		self.registerQueueService()
+
+	def serve_forever(self):
+		statusServer = DistillerQueueStatus()
+		statusServer.setDaemon(True)
+		statusServer.start()
+		while True:
+			msg = self.queue.recv_pyobj()
+			print msg
+			self.Log.logger.info("Got %s" % msg["URL"])
+			if msg["METHOD"] == "TO_JP2":
+				self.conv.send(msg["URL"])
+				self.Log.logger.info("Send %s to converter." % msg["URL"])
+			elif msg["METHOD"] == "TO_PDF":
+				self.pdfconv.send(msg["URL"])
+				self.Log.logger.info("Send %s to pdfconverter." % msg["URL"])
+				print msg["URL"]
+			del msg
+
+
+class DistillerQueueStatus(threading.Thread):
+	def run(self):
+		self.context = zmq.Context()
+		self.status = self.context.socket(zmq.REP)
+		self.status.bind(QUEUE_STATUS_ENDPOINT)
+                self.Log = DistillerLogger(QUEUE_LOG_FILE,"DistillerQueueStatus")
+		while True:
+			status_msg = self.status.recv()
+			#if status_msg == "GET_STATUS":
+			if status_msg == States.D_GSTATUS:
+				self.status.send(States.D_OK)
+			else:
+				self.status.send(States.D_ERROR)
+			del status_msg
+
+class DistillerQueueServer(object):
+	 def __init__(self):
+                self.stdin_path = '/dev/null'
+                self.stdout_path = '/dev/null'
+                self.stderr_path = '/dev/null'
+                self.pidfile_path =  QUEUE_PID_FILE
+                self.pidfile_timeout = 5
+         def run(self):
+                Queue = DistillerQueue()
+                Queue.createContext()
+		Queue.serve_forever()
+
+
+
+if __name__ == "__main__":
+
+	optparser = optparse.OptionParser(usage=usage,version=version)
+        (options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+
+        if len(args) == 0:
+                optparser.print_help()
+                sys.exit(-1)
+
+        if args[0] == 'start':
+                if not os.path.exists(QUEUE_PID_FILE):
+                        server = DistillerQueueServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+                else:
+                        print "PID File exists: %s" % QUEUE_PID_FILE
+        elif args[0] == 'stop':
+                if os.path.exists(QUEUE_PID_FILE):
+                        server = DistillerQueueServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._stop()
+                else:
+                        print "Queue slave server is not running."
+        elif args[0] == 'restart':
+                if os.path.exists(QUEUE_PID_FILE):
+                        server = DistillerQueueServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._restart()
+                else:
+                        server = DistillerQueueServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+        elif args[0] == 'status':
+                if os.path.exists(QUEUE_PID_FILE):
+                        fd = open(QUEUE_PID_FILE,'r')
+                        pid = fd.readlines()[0].strip()
+                        fd.close()
+                        print "Queue slave server is running, PID: %s" % pid
+                else:
+                        print "Queue slave server is not running"
+	elif args[0] == 'log':
+                log = DistillerTailLog(QUEUE_LOG_FILE)
+                log.follow()
+	elif args[0] == 'foreground':
+                Queue = DistillerQueue()
+                Queue.createContext()
+		Queue.serve_forever()
+        else:
+                optparser.print_help()
+                sys.exit(-1)
+

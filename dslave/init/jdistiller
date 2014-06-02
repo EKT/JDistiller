@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+#
+# jdistiller	This shell script takes care of starting and stopping
+#		jdistiller slave processes
+#
+# chkconfig: 345 98 02
+# description: jdistiller client processes
+
+### BEGIN INIT INFO
+# Provides: jdistiller
+# Required-Start: $network $local_fs $remote_fs
+# Required-Stop: $network $local_fs $remote_fs
+# Should-Start: $syslog $named ntpdate
+# Should-Stop: $syslog $named
+# Short-Description: start and stop jdistiller
+# Description: jdistiller client processes
+### END INIT INFO
+
+# Source function library.
+. /etc/init.d/functions
+
+# Source networking configuration.
+. /etc/sysconfig/network
+
+DUSER="jdistiller"
+DHOME="/home/$DUSER/dslave/slave"
+DPYTHON="/home/$DUSER/PYTHON/bin/python"
+
+prog=jdistiller
+lockfile=/var/lock/subsys/$prog
+
+start() {
+	[ "$EUID" != "0" ] && exit 4
+
+	echo -n "Starting distiller-worker: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-worker start"
+	RETVAL=$?
+        echo
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	sleep 1
+
+	echo -n $"Starting distiller-queue: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-queue start"
+	RETVAL=$?
+        echo
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	sleep 1
+
+	echo -n $"Starting distiller-converter: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-converter start"
+	RETVAL=$?
+        echo
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	sleep 1
+
+	echo -n $"Starting distiller-pdfconverter: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-pdfconverter start"
+	RETVAL=$?
+        echo
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	sleep 1
+}
+
+stop() {
+	[ "$EUID" != "0" ] && exit 4
+
+        echo -n $"Shutting down distiller-pdfconverter: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-pdfconverter stop"
+	RETVAL=$?
+        echo
+
+        echo -n $"Shutting down distiller-converter: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-converter stop"
+	RETVAL=$?
+        echo
+
+        echo -n $"Shutting down distiller-queue: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-queue stop"
+	RETVAL=$?
+        echo
+
+        echo -n $"Shutting down distiller-worker: "
+	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-worker stop"
+	RETVAL=$?
+        echo
+
+	echo -n "Cleaning up zombie distiller procs..."
+	for i in `ps -ef | grep distiller | grep -v grep | awk '{print $2}'`; 
+	do 
+		kill -9 $i > /dev/null 2>&1 ; 
+	done
+
+	rm -rf /tmp/distiller-*.pid > /dev/null 2>&1
+
+	RETVAL=$?
+        echo
+	return $RETVAL
+}
+
+status () {
+
+	echo -e "Status of distiller procs.."
+	cd $DHOME; $DPYTHON $DHOME/distiller-worker status
+	cd $DHOME; $DPYTHON $DHOME/distiller-queue status
+	cd $DHOME; $DPYTHON $DHOME/distiller-converter status
+	cd $DHOME; $DPYTHON $DHOME/distiller-pdfconverter status
+
+	echo -e "Process ids of distiller procs.."
+	ps -ef | grep distiller | grep -v grep
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  status)
+	status $prog
+	;;
+  restart|force-reload)
+	stop
+	sleep 2
+	start
+	;;
+  *)
+	echo $"Usage: $0 {start|stop|status|restart|try-restart|force-reload}"
+	exit 2
+esac

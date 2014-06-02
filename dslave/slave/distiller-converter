@@ -1,0 +1,581 @@
+#!/usr/bin/env python
+
+#   This file is part of JDistiller.
+#
+#   JDistiller is free software: you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation, either version 3 of the License, or
+#	(at your option) any later version.
+#
+#	JDistiller is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#	GNU General Public License for more details.
+#   You should have received a copy of the GNU General Public License
+#   along with Foobar. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright National Documentation Centre/NHRF 2012,2013,2014
+#
+# Software Contributors:
+# version 2.0 Michael-Angelos Simos, Panagiotis Stathopoulos
+# version 1.0 Chrysostomos Nanakos, Panagiotis Stathopoulos
+# version 0.1 Panagiotis Stathopoulos
+
+import zmq
+import json
+import platform
+import threading
+from threading import Thread
+from Queue import Queue
+import time
+import optparse
+import os
+import os.path
+import sys
+import signal
+from daemon import runner
+import logging
+import fnmatch
+#import popen2,commands
+import glob
+import uuid
+import subprocess
+import traceback
+import ConfigParser
+import cPickle
+from datetime import datetime
+import setproctitle
+# jp2k-distiller Modules
+from dutils import ColorAttr,States,DistillerLogger
+from dutils import DistillerTailLog
+
+version = """jp2k-distiller Version: 2.0"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log	    watch server daemon logfile
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log	  # watch daemon's logfile
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+SERVICE_NAME='distiller-converter'
+# Configuration file
+_conffile='distiller_slave.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+MASTER_HOSTNAME = config.get("MASTER","Hostname")
+
+CONVERTER_ENDPOINT=config.get("CONVERTER","Endpoint")
+CONVERTER_STATUS_ENDPOINT=config.get("CONVERTER","StatusEndpoint")
+MASTER_ENDPOINT="tcp://"+MASTER_HOSTNAME+":5001"
+CONVERTER_LOG_FILE=config.get("CONVERTER","LogFile")
+CONVERTER_PID_FILE=config.get("CONVERTER","PidFile")
+COMPRESS_SCRIPT=config.get("CONVERTER","DjatokaCompressScript")
+COMPRESS_PATH=config.get("CONVERTER","DjatokaCompressPath")
+
+busy_flag = False
+
+lock = threading.BoundedSemaphore()
+
+class DistillerConverter(object):
+	def __init__(self,converter_ipc_endpoint=CONVERTER_ENDPOINT,master_endpoint=MASTER_ENDPOINT):
+		self.converter_ipc_endpoint = converter_ipc_endpoint
+		self.master_endpoint = master_endpoint
+                self.Log = DistillerLogger(CONVERTER_LOG_FILE,"DistillerConverter")
+		self.pdf2pngqueue = Queue()
+		self.pngtif2jp2queue = Queue()
+		
+
+	def registerConverterService(self):
+		self.register_service = self.context.socket(zmq.REQ)
+		self.register_service.connect(self.master_endpoint)
+		self.register_service.send("REGISTER")
+                msg = self.register_service.recv()
+                if msg == States.D_TRY:
+			self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"Converter","SERVER":platform.node()})))
+			reg_status = self.register_service.recv()
+			if reg_status == States.D_REGISTERED:
+				self.Log.logger.info("Registered to master server")
+			elif reg_status == States.D_REG_ERROR:
+				self.Log.logger.info("Cannot register to master server")
+				sys.exit(2)
+			self.register_service.close()
+			del self.register_service
+		elif msg != States.D_TRY:
+			self.Log.logger.info("Message error.Cannot register to master server.")
+                        sys.exit(2)
+
+	def createContext(self):
+		self.context = zmq.Context()
+		self.conv = self.context.socket(zmq.PULL)
+		self.conv.connect(self.converter_ipc_endpoint)
+		self.registerConverterService()
+
+
+	def findpdffiles(self,dirname):
+		UnconvertedFiles = []
+		for fname in os.listdir(dirname):
+			if os.path.isfile(os.path.join(dirname,fname)):
+				if fnmatch.fnmatch(fname.lower(),"*.pdf"):
+					UnconvertedFiles.append(os.path.join(dirname,fname))
+		return UnconvertedFiles
+
+	def findpdffiles_withPNG_dir(self,dirname):
+		UnconvertedFiles = []
+		for fname in os.listdir(dirname):
+			if os.path.isfile(os.path.join(dirname,fname)):
+				if fnmatch.fnmatch(fname.lower(),"*.pdf"):
+					if os.path.isdir(os.path.join(dirname,fname.replace("pdf","png"))) or os.path.isdir(os.path.join(dirname,fname.replace("PDF","png"))):
+						if os.path.isfile(os.path.join(dirname,fname.replace("pdf","png"))+"/done.dpool") or  os.path.isfile(os.path.join(dirname,fname.replace("PDF","png"))+"/done.dpool"):
+							UnconvertedFiles.append(os.path.join(dirname,fname))
+		return UnconvertedFiles
+
+	def startPngBatchJob(self,fname):
+		status = None
+		pngdir = fname.split(".")[0]+".png"
+		statusFile = fname.split(".")[0]+".dps"
+		stdoutFile = fname.split(".")[0]+".png.stdout"
+		stderrFile = fname.split(".")[0]+".png.stderr"
+		try:
+			os.mkdir(pngdir,0775)
+		except Exception, e:
+			self.Log.logger.error("startPngBatchJob: Cannot create directory %s" % pngdir)
+			self.Log.logger.error("startPngBatchJob: Error %s" % e)
+
+		#GS_cmd = "gs -SDEVICE=png16m  -r300x300 -sOutputFile="+pngdir+"/%05d.png -dNOPAUSE -dBATCH -- "+str(fname)
+		GS_cmd = ["/usr/bin/gs",
+				"-SDEVICE=png16m",
+				"-r300x300",
+				"-sOutputFile=%s%s" % (pngdir,"/%05d.png"),
+				"-dNOPAUSE", 
+				"-dBATCH -- ",
+				str(fname)]
+		try:
+			statusData = {"creationdate": datetime.utcnow(),"pdf2png": None, "png2jp2": None, "tiff2jp2": None, "node": platform.node()}
+			startTime = datetime.now()
+		except Exception, e:
+			self.Log.logger.error("startPngBatchJob: Cannot retrieve time")
+
+		try:
+			#proc = popen2.Popen3(GS_cmd,capturestderr=True)
+			#return_value = proc.wait()
+			#child_stderr = proc.childerr.read()
+			#if child_stderr:
+			#	if child_stderr.find("exit code 1") > 0:
+			#		raise OSError
+			#signal_number = (return_value & 0x0F)
+			#if not signal_number:
+			#	exit_status = (return_value >> 8)
+			#	if exit_status:
+			#		raise OSError
+			sp = subprocess.Popen(args=GS_cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+			status = True
+		except:
+			self.Log.logger.error("GS Error Exception: Conversion to PNG failed -> %s" % fname)
+			self.Log.logger.error("Traceback:\n%s" % traceback.format_exc())
+			status = False
+		stdout,stderr = sp.communicate()
+		if stderr:
+			self.Log.logger.error("GS Error: Conversion to PNG failed -> %s" % fname)
+			status = False
+			# Write stderr to local file
+			fd = open(stderrFile,"w")
+			fd.write(stderr)
+			fd.close()
+			del fd
+		endTime = datetime.now()
+		# Write done signature - multifile support
+		if status is True:
+			self.Log.logger.debug("Creating done.dpool signature in pngdir %s" % pngdir)
+			fd = open(pngdir+"/done.dpool","wb")
+			fd.write(" ")
+			fd.close()
+		# Write stdout to local file
+		fd = open(stdoutFile,"w")
+		fd.write(stdout)
+		fd.close()
+		statusData["pdf2png"] = str(endTime-startTime)
+		try:
+			cPickle.dump(statusData, open(statusFile,"wb"))
+		except Exception, e:
+			self.Log.logger.error("Cannot write status file %s. Error %s." % (statusFile,e))
+		return status
+
+	def startJp2SubJob(self,in_dir,out_dir):
+		CWD=os.getcwd()
+		stdoutFile = out_dir.split(".")[0]+".jp2.stdout"
+		stderrFile = out_dir.split(".")[0]+".jp2.stderr"
+		# With out_dir we preserve the standard path of Tiff to JP2 conversion
+		try:
+			os.chdir(COMPRESS_PATH)
+		except:
+			self.Log.logger.error("Cannot chdir to %s" % COMPRESS_PATH)
+			return False
+		JP2_cmd = [COMPRESS_PATH+COMPRESS_SCRIPT,
+				"-i",
+				in_dir,
+				"-o",
+				out_dir]
+
+		#JP2_cmd = COMPRESS_SCRIPT+" -i "+in_dir+" -o "+out_dir
+		#try:
+		#	return_value = os.system(JP2_cmd)
+		#	signal_number = (return_value & 0x0F)
+		#	if not signal_number:
+		#		exit_status = (return_value >> 8)
+		#		if exit_status:
+		#			raise OSError
+		#except:
+		#	self.Log.logger.error("JP2 Error: Conversion to JP2 failed -> %s" % out_dir)
+		#	os.chdir(CWD)
+		#	return False
+		#os.chdir(CWD)
+		#return True
+		
+		self.Log.logger.info(JP2_cmd)
+		status = None
+		try:
+			sp = subprocess.Popen(args=JP2_cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+			status = True
+		except Exception,e:
+			self.Log.logger.error("JP2-KAKADU-DJATOKA Error Exception: Conversion to JP2 failed -> %s" % in_dir)
+			self.Log.logger.error("JP2-KAKADU-DJATOKA Error -> %s" % e)
+			status = False
+		stdout,stderr = sp.communicate()
+		if stderr:
+			self.Log.logger.error("JP2 Error: Conversion to JP2 failed -> %s" % in_dir)
+			status = False
+			# Write stderr to local file
+			fd = open(stderrFile,"w")
+			fd.write(stderr)
+			fd.close()
+			del fd
+		# Write stdout to local file
+		fd = open(stdoutFile,"w")
+		fd.write(stdout)
+		fd.close()
+		return status
+
+	def createBooktxt(self,jp2dir):
+		self.Log.logger.info("Create book.txt in %s" % jp2dir)
+		total_files = len(glob.glob1(jp2dir,"*.jp2"))
+		flist = []
+		try:
+			f = open(jp2dir+"/book.txt","w")
+			f.write(str(total_files)+'\n')
+			for files in os.listdir(jp2dir):
+				if files != 'book.txt':
+					flist.append(files)
+			flist.sort()
+			for files in flist:
+				f.write(files+'\n')
+		except:
+			self.Log.logger.error("Error while creating book.txt in %s" % jp2dir)
+		finally:
+			f.close()
+
+	def createSignature(self,jp2dir):
+		self.Log.logger.info("Create export/move signature in %s" % jp2dir)
+		try:
+			f = open(jp2dir+"/done.sig","w")
+			f.write(str(uuid.uuid5(uuid.NAMESPACE_URL,jp2dir))+'\n')
+		except:
+			self.Log.logger.error("Error while creating signature in %s" % jp2dir)
+		finally:
+			f.close()
+
+
+	def startPdfJp2BatchJob(self,fname):
+		jp2dir = fname.split(".")[0]+".jp2"
+		pngdir = fname.split(".")[0]+".png"
+		statusFile = fname.split(".")[0]+".dps"
+		try:
+			os.mkdir(jp2dir,0775)
+		except:
+			self.Log.logger.error("startPdfJp2BatchJob: Cannot create directory %s" % jp2dir)
+	
+		if os.path.exists(statusFile) is True:
+			try:
+				statusData = cPickle.load(open(statusFile,"rb"))
+			except Exception, e:
+				self.Log.logger.error("startPdfJp2BatchJob: Cannot read status file %s" % statusFile)
+		else:
+			try:
+				statusData = {"creationdate": datetime.utcnow(),"pdf2png": None, "png2jp2": None, "tiff2jp2": None, "node": platform.node()}
+				cPickle.dump(statusData,open(statusFile,"wb"))
+			except Exception, e:
+				self.Log.logger.error("startPdfJp2BatchJob: Cannot create/write status file %s" % statusFile)
+
+		startTime = datetime.now()
+		ret_status = self.startJp2SubJob(pngdir,jp2dir)
+		if ret_status == True:
+			endTime = datetime.now()
+			statusData["png2jp2"]=str(endTime-startTime)
+			try:
+				cPickle.dump(statusData, open(statusFile,"wb"))
+			except Exception, e:
+				self.Log.logger.error("Cannot write status file %s. Error %s." % (statusFile,e))
+			self.createBooktxt(jp2dir)
+			self.createSignature(jp2dir)
+		return ret_status
+
+	def startTifJp2BatchJob(self,dirname):
+		jp2dir = dirname+"/"+dirname.split("/")[-1]+".jp2"
+		pngdir = dirname+"/"+dirname.split("/")[-1]+".png"
+		statusFile = dirname+"/"+dirname.split("/")[-1]+".dps"
+		try:
+			os.mkdir(jp2dir,0775)
+		except:
+			self.Log.logger.error("startTifJp2BatchJob: Cannot create directory %s" % jp2dir)
+		try:
+			os.mkdir(pngdir,0775)
+		except:
+			self.Log.logger.error("startTifJp2BatchJob: Cannot create directory %s" % pngdir)
+
+		if os.path.exists(statusFile) is True:
+			try:
+				statusData = cPickle.load(open(statusFile,"rb"))
+			except Exception, e:
+				self.Log.logger.error("startTifJp2BatchJob: Cannot read status file %s" % statusFile)
+		else:
+			try:
+				statusData = {"creationdate": datetime.utcnow(),"pdf2png": None, "png2jp2": None, "tiff2jp2": None, "node": platform.node()}
+				cPickle.dump(statusData,open(statusFile,"wb"))
+			except Exception, e:
+				self.Log.logger.error("startTifJp2BatchJob: Cannot create/write status file %s" % statusFile)
+		
+		startTime = datetime.now()
+		ret_status = self.startJp2SubJob(dirname,jp2dir)
+		if ret_status == True:
+			endTime = datetime.now()
+			statusData["tiff2jp2"]=str(endTime-startTime)
+			try:
+				cPickle.dump(statusData, open(statusFile,"wb"))
+			except Exception, e:
+				self.Log.logger.error("Cannot write status file %s. Error %s." % (statusFile,e))
+			self.createBooktxt(jp2dir)
+			self.createSignature(jp2dir)
+		return ret_status
+
+	def Pdf2PngWorker(self,pqueue,jqueue):
+		#self.Log.logger.info("PNG Converter started")
+		while True:
+			dirname = pqueue.get()
+			NewFiles = self.findpdffiles(dirname) #If not pdf file and only tif files move the queue object to Jp2Worker.
+			if len(NewFiles) > 0:
+				NewFiles.sort()
+				files_status = []
+				for fname in NewFiles:
+					#pngdir = fname.split(".")[0]+".png"
+					ret_status = self.startPngBatchJob(fname)
+					if ret_status == True:
+						files_status.append(True)
+						#pqueue.task_done()
+						#jqueue.put(dirname)
+						self.Log.logger.info(fname+" has been converted to png.")
+					elif ret_status == False:
+						files_status.append(False)
+						self.Log.logger.error("Pdf to PNG failed in %s" % fname)
+						try:
+							failed_signature = fname.rsplit("/",1)[0]+"/failed.lock" 
+							self.Log.logger.info("Creating Failed lock directory: %s" % failed_signature)
+							os.mkdir(failed_signature)
+						except OSError:
+							self.Log.logger.error("Cannot create failed.lock directory")
+						#pqueue.task_done() # Don't push failed queue object to Jp2 Queue
+						# Send email to mailing list - Per failed Directory or All failed directories at once?
+						# Do it here or do it in distiller-exporter?
+				if False in files_status:
+					pqueue.task_done()
+				else:
+					jqueue.put(dirname)
+					pqueue.task_done()
+			else:
+				jqueue.put(dirname)
+				pqueue.task_done()
+
+
+	def PngTiff2Jp2Worker(self,jqueue):
+		#self.Log.logger.info("JP2 Converter started")
+		while True:
+			dirname = jqueue.get()
+			NewPdfFiles = self.findpdffiles_withPNG_dir(dirname)
+			if len(NewPdfFiles) > 0:
+				NewPdfFiles.sort()
+				for fname in NewPdfFiles:
+					ret_status = self.startPdfJp2BatchJob(fname)
+					if ret_status is True:
+						self.Log.logger.info(fname+" converted to JP2")
+					else:
+						self.Log.logger.error(fname+" did not convert to JP2")
+			else:
+					ret_status = self.startTifJp2BatchJob(dirname)
+					if ret_status:
+						self.Log.logger.info(dirname+" converted to JP2")
+					else:
+						self.Log.logger.error(dirname+" did not convert to JP2")
+			jqueue.task_done()
+
+	def detectCPUs(self):
+		if hasattr(os,"sysconf"):
+			if os.sysconf_names.has_key("SC_NPROCESSORS_ONLN"):
+				ncpus = os.sysconf("SC_NPROCESSORS_ONLN")
+       				if isinstance(ncpus, int) and ncpus > 0:
+           				return ncpus
+		return None
+
+	def startWorkers(self,pthreads,jthreads):
+		for i in range(int(pthreads)):
+			worker = Thread(target=self.Pdf2PngWorker, args=(self.pdf2pngqueue,self.pngtif2jp2queue))
+			worker.setDaemon(True)
+			worker.start()
+		for i in range(int(jthreads)):
+			jworker = Thread(target=self.PngTiff2Jp2Worker, args=(self.pngtif2jp2queue,))
+			jworker.setDaemon(True)
+			jworker.start()
+
+
+	def serve_forever(self):
+		statusServer = DistillerConverterStatus()
+		statusServer.setQueues(self.pdf2pngqueue,self.pngtif2jp2queue)
+		statusServer.setDaemon(True)
+		statusServer.start()
+		cpu_cores = self.detectCPUs()
+		self.startWorkers(cpu_cores,cpu_cores)	
+		objectcounter=0
+		global busy_flag
+		while True:
+			lock.acquire()
+			try:
+				busy_flag = False
+			finally:
+				lock.release()
+			msg = self.conv.recv()
+			if msg == States.D_FIREUP:
+				if self.pdf2pngqueue.qsize() > 0:
+					lock.acquire()
+					try:
+						busy_flag = True
+					finally:
+						lock.release()
+					self.Log.logger.info("Starting conversion job(s).")
+					self.pdf2pngqueue.join()
+					self.Log.logger.info("..starting jp2 conversion.")
+					self.pngtif2jp2queue.join()
+					self.Log.logger.info("..finished jp2 conversion.")
+					objectcounter=0
+				elif self.pdf2pngqueue.qsize() == 0 and objectcounter > 0:
+					lock.acquire()
+					try:
+						busy_flag = True
+					finally:
+						lock.release()
+					self.Log.logger.info("Starting conversion job(s).")
+					self.pdf2pngqueue.join()
+					self.Log.logger.info("..starting jp2 conversion.")
+					self.pngtif2jp2queue.join()
+					self.Log.logger.info("..finished jp2 conversion.")
+					objectcounter=0
+			else:
+				self.pdf2pngqueue.put(msg)
+				objectcounter+=1
+				self.Log.logger.info("Adding directory for conversion %s" % msg)
+			#self.Log.logger.info("Got %s" % msg)
+
+
+class DistillerConverterStatus(threading.Thread):
+	def setQueues(self,pngqueue,jp2queue):
+		self.pngqueue = pngqueue
+		self.jp2queue = jp2queue
+	def run(self):
+		self.context = zmq.Context()
+		self.status = self.context.socket(zmq.REP)
+		self.status.bind(CONVERTER_STATUS_ENDPOINT)
+                self.Log = DistillerLogger(CONVERTER_LOG_FILE,"DistillerConverterStatus")
+		global busy_flag
+		while True:
+			status_msg = self.status.recv()
+			if status_msg == "GET_STATUS":
+				self.status.send("OK")
+			elif status_msg == "GET_BUSY":
+				if busy_flag == True:
+					self.status.send("BUSY")
+				elif busy_flag == False:
+					self.status.send("NO_BUSY")
+			elif status_msg == "GET_QUEUES_SIZE":
+					self.status.send_pyobj({"PNGQUEUE":self.pngqueue.qsize(),"JP2QUEUE":self.jp2queue.qsize()})
+			else:
+				self.status.send("ERROR")
+
+
+class DistillerConverterServer(object):
+	def __init__(self):
+                self.stdin_path = '/dev/null'
+                self.stdout_path = '/dev/null'
+                self.stderr_path = '/dev/null'
+                self.pidfile_path =  CONVERTER_PID_FILE
+                self.pidfile_timeout = 5
+        def run(self):
+		Converter = DistillerConverter()
+		Converter.createContext()
+		Converter.serve_forever()
+
+
+
+if __name__ == "__main__":
+	
+	optparser = optparse.OptionParser(usage=usage,version=version)
+        (options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+	
+        if len(args) == 0:
+                optparser.print_help()
+                sys.exit(-1)
+
+        if args[0] == 'start':
+                if not os.path.exists(CONVERTER_PID_FILE):
+                        server = DistillerConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+                else:
+                        print "PID File exists: %s" % CONVERTER_PID_FILE
+        elif args[0] == 'stop':
+                if os.path.exists(CONVERTER_PID_FILE):
+                        server = DistillerConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._stop()
+                else:
+                        print "Converter slave server is not running."
+        elif args[0] == 'restart':
+                if os.path.exists(CONVERTER_PID_FILE):
+                        server = DistillerConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._restart()
+                else:
+                        server = DistillerConverterServer()
+                        daemon_runner = runner.DaemonRunner(server)
+                        daemon_runner._start()
+        elif args[0] == 'status':
+                if os.path.exists(CONVERTER_PID_FILE):
+                        fd = open(CONVERTER_PID_FILE,'r')
+                        pid = fd.readlines()[0].strip()
+                        fd.close()
+                        print "Converter slave server is running, PID: %s" % pid
+                else:
+                        print "Converter slave server is not running"
+	elif args[0] == 'log':
+                log = DistillerTailLog(CONVERTER_LOG_FILE)
+                log.follow()
+        else:
+                optparser.print_help()
+                sys.exit(-1)

@@ -1,0 +1,10 @@
+pyzmq
+python-daemon
+setproctitle
+pyinotify
+psycopg2
+pymongo
+paramiko
+basicauth
+psutil
+setproctitle

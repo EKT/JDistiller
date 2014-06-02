@@ -1,0 +1,4 @@
+The .bashrc file found in this folder must be copied under /home/jdistiller
+jdistiller init script must be copied under /etc/init.d/
+
+
