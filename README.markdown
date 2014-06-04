@@ -15,6 +15,11 @@ JP2k-distiller uses a multilayered distributed software architecture. The system
 message layer among different nodes, GlusterFS is used as the elastic common 
 datastore between all worker nodes and the master server.
 
+![alt text](https://github.com/EKT/JDistiller/raw/markdown_images/detailed-schema.png)
+
+![alt text](https://github.com/EKT/JDistiller/raw/markdown_images/schema.png)
+
+
 # Installation
 ------------------
 
