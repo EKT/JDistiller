@@ -1,0 +1,165 @@
+'''CURL POST TEST - curl http://simos:simospassword@localhost:8080/ -F journal_id=X -F article_id=888 -F article_title="Title" -F article_author="Author" -F pdf_id=100 -F pdf_url=http://example.org/deltion/888/100 -L -v'''
+from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
+import urlparse
+import cgi
+from SocketServer import ThreadingMixIn
+import basicauth
+import os
+import urllib
+
+GET_MSG=open("dfile.api.html","r").read()
+
+UsPasswd = {'simos':'simos_password', 'user2':'user2_password'}
+
+rootPath = '/SILO/converter'
+
+class DistillerWebHandler(BaseHTTPRequestHandler):
+    
+    def do_GET(self):
+        parsed_path = urlparse.urlparse(self.path)
+        message_parts = [
+                'CLIENT VALUES:',
+                'client_address=%s (%s)' % (self.client_address,
+                                            self.address_string()),
+                'command=%s' % self.command,
+                'path=%s' % self.path,
+                'real path=%s' % parsed_path.path,
+                'query=%s' % parsed_path.query,
+                'request_version=%s' % self.request_version,
+                '',
+                'SERVER VALUES:',
+                'server_version=%s' % self.server_version,
+                'sys_version=%s' % self.sys_version,
+                'protocol_version=%s' % self.protocol_version,
+                '',
+                'HEADERS RECEIVED:',
+                ]
+        for name, value in sorted(self.headers.items()):
+            message_parts.append('%s=%s' % (name, value.rstrip()))
+        message_parts.append('')
+        message = '\r\n'.join(message_parts)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(GET_MSG)
+        return
+
+    def do_POST(self):
+        # Parse the form data posted
+        form = cgi.FieldStorage(
+            fp=self.rfile, 
+            headers=self.headers,
+            environ={'REQUEST_METHOD':'POST',
+                     'CONTENT_TYPE':self.headers['Content-Type'],
+                     })
+
+	username,password = basicauth.decode(self.headers['Authorization'])
+	try:
+           if UsPasswd[username] != password:
+	        # Begin the response for the unauthorized user
+	        self.send_response(401)
+	        self.end_headers()
+	        self.wfile.write('HTTP/1.1 401 Unauthorized\nLocation: http://dpool.ekt.gr\n')
+		return
+	   else:
+		HTMLEntities = {}
+		for field in form.keys():
+			HTMLEntities[field]= form[field].value
+
+		if len(HTMLEntities) != 6:
+	        	self.send_response(404)
+		        self.end_headers()
+		        self.wfile.write('HTTP/1.1 404 Wrong POST Request\nLocation: http://dpool.ekt.gr\n')
+		
+		# Create Directories in repository	
+		if not os.path.exists(os.path.join(rootPath,HTMLEntities['journal_id'])):
+			os.mkdir(os.path.join(rootPath,HTMLEntities['journal_id']))
+		
+		rootPathLevel = os.path.join(rootPath,HTMLEntities['journal_id'])
+		if not os.path.exists(os.path.join(rootPathLevel,HTMLEntities['article_id'])):
+			os.mkdir(os.path.join(rootPathLevel,HTMLEntities['article_id']))
+		
+		rootPathLevel = os.path.join(rootPathLevel,HTMLEntities['article_id'])
+		# Check if file exists, maybe distiller hasn't run yet and user in the meanwhile has updated PDF file
+		if os.path.exists(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".pdf")):
+			os.unlink(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".pdf"))
+		# Callback and metadata information
+		if os.path.exists(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".txt")):
+			os.unlink(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".txt"))
+
+		# Create dlock.jp2 dir in rootPathLevel,download PDF file,create file as pdf_id.pdf
+		# create pdf_id.txt metadata file, save contents, trigger conversion either by removing dlock.jp2
+		# or communicate with distiller-dispatcher if pdf file has URGENT tag.
+		
+		# Create dlock.jp2 lockspin directory
+		if not os.path.exists(os.path.join(rootPathLevel,"dlock.jp2")):
+			os.mkdir(os.path.join(rootPathLevel,"dlock.jp2"))
+
+		# If PDF file already existed has been unlinked before. Open new file
+		pdf_file = open(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".pdf"),'wb')
+		web_file = urllib.urlopen(HTMLEntities['pdf_url'])
+		pdf_file.write(web_file.read()) #Isn't it great!
+		web_file.close()
+		pdf_file.close()
+		# pdf_id.txt for epublishing platform
+		if HTMLEntities['journal_id'] == 'epublishing':
+			# Create pdf_id.txt file
+			base_url = 'http://epublishing.ekt.gr/'
+			metadata_file = open(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".txt"),'wb')
+			metadata_file.write("[callback]\n")
+
+			metadata_file.write("url="+base_url+"bookreader/updatefilestatus/"+HTMLEntities['article_id']+"/"+HTMLEntities['pdf_id']+"\n")
+			metadata_file.write("[metadata]\n")
+			metadata_file.write("article_title="+HTMLEntities['article_title']+"\n")
+			metadata_file.write("article_author="+HTMLEntities['article_author']+"\n")
+			metadata_file.write("article_url="+base_url+HTMLEntities['article_id']+"\n")
+			metadata_file.write("journal_url="+base_url+"\n")
+			metadata_file.close()
+		# pdf_id.txt for e-journals
+		else: 
+			# Create pdf_id.txt file
+			metadata_file = open(os.path.join(rootPathLevel,HTMLEntities['pdf_id']+".txt"),'wb')
+			metadata_file.write("[callback]\n")
+
+			if HTMLEntities['pdf_url'].find("/viewFile/") > 0:
+				metadata_file.write("url="+HTMLEntities['pdf_url'].replace("/viewFile/","/updateFileStatus/",1)+"\n")
+			elif HTMLEntities['pdf_url'].find("/viewFileNoAuth/") > 0:
+				metadata_file.write("url="+HTMLEntities['pdf_url'].replace("/viewFileNoAuth/","/updateFileStatus/",1)+"\n")
+
+			metadata_file.write("[metadata]\n")
+			metadata_file.write("article_title="+HTMLEntities['article_title']+"\n")
+			metadata_file.write("article_author="+HTMLEntities['article_author']+"\n")
+			if HTMLEntities['pdf_url'].find("/viewFile/") > 0:
+				metadata_file.write("article_url="+HTMLEntities['pdf_url'].replace("/viewFile/","/view/").split("/"+HTMLEntities['pdf_id'])[0]+"\n")
+			elif HTMLEntities['pdf_url'].find("/viewFileNoAuth/") > 0:
+				metadata_file.write("article_url="+HTMLEntities['pdf_url'].replace("/viewFileNoAuth/","/view/").split("/"+HTMLEntities['pdf_id'])[0]+"\n")
+    		metadata_file.write("journal_url="+HTMLEntities['pdf_url'].split('/article')[0]+"\n")
+    		metadata_file.close()
+
+		# Remove dlock.jp2 directory 
+		if os.path.exists(os.path.join(rootPathLevel,"dlock.jp2")):
+			os.rmdir(os.path.join(rootPathLevel,"dlock.jp2"))
+
+		# Trigger dispatcher (???)
+
+		self.send_response(200)
+	        self.end_headers()
+	        self.wfile.write('HTTP/1.1 200 File uploaded to dPool Server\nLocation: http://dpool.ekt.gr\n')
+        	return
+	except Exception, e:
+	        self.send_response(401)
+	        self.end_headers()
+	        self.wfile.write('HTTP/1.1 401 Unauthorized Access\nLocation: http://dpool.ekt.gr\n')
+		print e
+		return
+
+    def do_OPTIONS(self):
+	pass
+
+
+class ThreadedHTTPServer(ThreadingMixIn,HTTPServer):
+	"""Handle Requests in separate threads"""
+
+if __name__ == '__main__':
+    server = ThreadedHTTPServer(('dmaster.extcloud0.ekt.gr', 8080), DistillerWebHandler)
+    print 'Starting server, use <Ctrl-C> to stop'
+    server.serve_forever()
