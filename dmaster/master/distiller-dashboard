@@ -1,0 +1,394 @@
+import json
+import zmq
+import sqlite3
+import uuid
+import datetime
+from datetime import datetime
+import threading
+import time
+import optparse
+import os
+import os.path
+import sys
+import signal
+from daemon import runner
+import logging
+import platform
+import pymongo
+import socket
+import setproctitle
+import ConfigParser
+# jp2k-distiller Modules
+from dutils import ColorAttr,States,Services,DistillerLogger,DistillerTailLog
+
+version = """jp2k-distiller Version: 2.1"""
+usage = """usage: %prog [options] command [arg...]
+
+commands:
+  start     start the server daemon
+  stop      stop the server daemon
+  restart   restart the server daemon
+  status    return server daemon status
+  log       watch server's logfile (enable DEBUG mode)
+
+Example session:
+  %prog start     # starts daemon
+  %prog status    # print daemon's status
+  %prog log       # watch daemon's logfile (enable DEBUG mode)
+  %prog stop      # stops daemon
+  %prog restart   # restarts daemon"""
+
+
+
+DEBUG_ = True
+_conffile='distiller_master.conf'
+## Read Configuration variables
+config=ConfigParser.RawConfigParser()
+config.read(_conffile)
+
+SERVICE_NAME = "distiller-dashboard"
+MASTER_SERVER_ENDPOINT = config.get("DASHBOARD","MasterServerEndpoint")
+DASH_SERVER_PUB_ENDPOINT = config.get("DASHBOARD","DashServerPubEndpoint")
+DASH_PID_FILE = config.get("DASHBOARD","DashPIDFile")
+DASH_LOG_FILE =  config.get("DASHBOARD","DashLogFile") 
+DASH_SERVER_STATUS_ENDPOINT = config.get("DASHBOARD","DashServerStatusEndpoint")
+
+class DistillerDash(object):
+	def __init__(self,master_endpoint=MASTER_SERVER_ENDPOINT,dashserver_pub_endpoint=DASH_SERVER_PUB_ENDPOINT):
+		self.master_endpoint = master_endpoint
+		self.dashserver_pub_endpoint = dashserver_pub_endpoint
+		self.Log = DistillerLogger(DASH_LOG_FILE,"DistillerDashboardDaemon")
+
+	def createContext(self):
+		print "in createContext"
+		try:
+			self.context = zmq.Context()
+			self.dashserver_pub = self.context.socket(zmq.PUB)
+			self.dashserver_pub.bind(self.dashserver_pub_endpoint)
+			self.master = self.context.socket(zmq.REQ)
+			self.master.connect(self.master_endpoint)
+		except:
+			self.Log.logger.error("ZMQ error in createContext()")
+			sys.exit(2)
+		self.registerDashService()
+
+	def registerDashService(self):
+		print "in registerDashService"
+		self.register_service = self.context.socket(zmq.REQ)
+                self.register_service.connect(self.master_endpoint)
+                self.register_service.send(States.D_REGISTER)
+		print '1'
+                msg = self.register_service.recv()
+		print "2"
+                if msg == States.D_TRY:
+                        self.register_service.send(json.dumps(dict({"REGISTER_SERVICE":"Dashboard Server","SERVER":platform.node()})))
+                        reg_status = self.register_service.recv()
+                        if reg_status == States.D_REGISTERED:
+                                self.Log.logger.info("Registered to master server")
+                        elif reg_status == States.D_ERR_REGISTERED:
+                                self.Log.logger.info("Cannot register to master server")
+                                sys.exit(2)
+                        self.register_service.close()
+                        del self.register_service
+			print 'DONE'
+                elif msg != States.D_TRY:
+                        self.Log.logger.info("Message error.Cannot register to master server.")
+                        sys.exit(2)
+
+
+
+	def check_master_service(self,service):
+		print "in check_master_service"
+		status = self.context.socket(zmq.REQ)
+                status.setsockopt(zmq.LINGER,0)
+		if service.split(' ')[0].lower() == "master":
+	                status.connect(MASTER_SERVER_ENDPOINT)
+		else:
+	                status.connect('ipc:///tmp/distiller_'+service.split(' ')[0].lower()+'.status') #FIXME: This is hard coded to tmp directory. Use conf file for that
+		status.send(States.D_GETSTATUS)
+		poller = zmq.Poller()
+		poller.register(status,zmq.POLLIN)
+		if poller.poll(250):
+			msg = status.recv()
+			if msg == States.D_OK:
+				status.close()
+				del status
+				return "Running"
+		else:
+			del status
+			return "Down"
+
+	def get_mongodb_stats(self,active_nodes):
+		print "in get_mongodb_stats"
+		#Populate dictionary with active_nodes
+		mongodb_totalpages_msg = {}
+		mongodb_totalfiles_msg = {}
+		mongodb_meantime_totalfiles_msg = {}
+		mongodb_meantime_totalpages_msg = {}
+		#print active_nodes
+		for node in active_nodes:
+			mongodb_totalpages_msg[node] = [0,0,0,0,0,0,0,0,0,0,0,0]
+			mongodb_totalfiles_msg[node] = [0,0,0,0,0,0,0,0,0,0,0,0]
+			mongodb_meantime_totalfiles_msg[node] = [0,0,0]
+			mongodb_meantime_totalpages_msg[node] = [0,0,0]
+		db = pymongo.Connection('mongodb00.prod.ekt.gr').dpool_cluster_dmaster
+		Months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+		for i in xrange(0,12):
+			for post in db[Months[i]+'_'+str(datetime.now().year)+'_totalpages'].find():
+				for key, value in post.iteritems(): #FIXME - Preserve this order 1: _id , 2: value
+					if key == '_id':
+						node = value
+					if key == 'value':
+						for total in value.itervalues():
+							mongodb_totalpages_msg[node][i] = total
+			for post in db[Months[i]+'_'+str(datetime.now().year)+'_totalfiles'].find():
+				for key, value in post.iteritems(): #FIXME - Preserve this order 1: _id , 2: value
+					if key == '_id':
+						node = value
+					if key == 'value':
+						for total in value.itervalues():
+							mongodb_totalfiles_msg[node][i] = total
+		results = db.meantime_for_totalpages.find()
+		for post in results:
+			for key,value in post.iteritems():
+				if key == '_id':
+					node = value
+				if key == 'value':
+					if node in mongodb_meantime_totalpages_msg:
+						mongodb_meantime_totalpages_msg[node][0] = value["pdf2png_meantime_per_page"]
+						mongodb_meantime_totalpages_msg[node][1] = value["png2jp2_meantime_per_page"]
+						mongodb_meantime_totalpages_msg[node][2] = value["tiff2jp2_meantime_per_page"]
+		results = db.meantime_for_totalfiles.find()
+		for post in results:
+			for key,value in post.iteritems():
+				if key == '_id':
+					node = value
+				if key == 'value':
+					if node in mongodb_meantime_totalpages_msg:
+						mongodb_meantime_totalfiles_msg[node][0] = value["pdf2png_meantime_per_file"]
+						mongodb_meantime_totalfiles_msg[node][1] = value["png2jp2_meantime_per_file"]
+						mongodb_meantime_totalfiles_msg[node][2] = value["tiff2jp2_meantime_per_file"]
+		#print {"mongo_totalpages": mongodb_totalpages_msg, "mongo_totalfiles": mongodb_totalfiles_msg, "mongo_meantime_totalfiles":mongodb_meantime_totalfiles_msg, "mongo_meantime_totalpages":mongodb_meantime_totalpages_msg}
+		return {"mongo_totalpages": mongodb_totalpages_msg, "mongo_totalfiles": mongodb_totalfiles_msg, "mongo_meantime_totalfiles":mongodb_meantime_totalfiles_msg, "mongo_meantime_totalpages":mongodb_meantime_totalpages_msg}
+
+	def run(self):
+		print "in run"
+		statusPublisher = DistillerDashStatus()
+                
+		statusPublisher.setDaemon(True)
+                statusPublisher.start()
+		print 'test'
+		nodejsStatus = DistillerDashNodeJSStatus()
+		nodejsStatus.setDaemon(True)
+		nodejsStatus.start()
+		print "create_context"
+		self.createContext()
+		print "before serve_forever"
+		self.serve_forever()
+		
+	def serve_forever(self):
+		while True:
+			print 'SERVE FOREVER'
+			print States.D_ACTIVE_NODES
+			self.Log.logger.error("ZMQ error in createContext()")
+			self.master.send(States.D_ACTIVE_NODES)
+			mastermsg = self.master.recv_pyobj()
+			self.Log.logger.info("Active Nodes: %s " % mastermsg)
+			active_nodes = []
+			dashmsg = {}
+			for key in sorted(mastermsg.iterkeys()):
+				active_nodes.append(key)
+			self.master.send(States.D_REG_NODES)
+			mastermsg = self.master.recv_pyobj()
+			reg_nodes = []
+			for key in sorted(mastermsg.iterkeys()):
+				reg_nodes.append(key)
+			self.Log.logger.info(reg_nodes)
+			self.master.send(States.D_NODES_STATUS)
+			statusmsg = self.master.recv_pyobj()
+			dashmsg = {"activenodes": active_nodes,"status": statusmsg, "regnodes": reg_nodes}
+			del statusmsg
+			self.master.send(States.D_MASTER_SERVICES)
+			masterservicesmsg = self.master.recv_pyobj()
+			new_masterservicesmsg = {} 
+			for key,value in masterservicesmsg.iteritems():
+				new_masterservicesmsg[key+'.services'] = value
+				for service in masterservicesmsg[key]:
+					new_masterservicesmsg[key+"."+service.split(' ')[0]] = self.check_master_service(service)
+			dashmsg["master_services"] = new_masterservicesmsg
+			self.Log.logger.info(new_masterservicesmsg)
+			del masterservicesmsg
+			for hostname in active_nodes:
+	 			self.status = self.context.socket(zmq.REQ)
+	                        self.status.setsockopt(zmq.LINGER,0)
+	                        self.status.connect("tcp://"+hostname+":5002")
+	                        self.status.send(States.D_GETSTATS)
+	                        self.poller = zmq.Poller()
+	                        self.poller.register(self.status,zmq.POLLIN)
+	                        if self.poller.poll(3000):
+	                                msg = self.status.recv_json()
+	                                if msg: dashmsg[hostname] = msg
+	                        else:
+					dashmsg[hostname] = States.D_DOWN
+	                                self.Log.logger.info("Worker does not respond: %s" % hostname)
+				self.status.close()
+				del self.status; del self.poller
+			for hostname in active_nodes:
+	 			self.status = self.context.socket(zmq.REQ)
+	                        self.status.setsockopt(zmq.LINGER,0)
+	                        self.status.connect("tcp://"+hostname+":5002")
+	                        self.status.send(States.D_GETQUEUES)
+	                        self.poller = zmq.Poller()
+	                        self.poller.register(self.status,zmq.POLLIN)
+	                        if self.poller.poll(3000):
+	                                msg = self.status.recv_json()
+	                                if msg: dashmsg[hostname+".queue"] = msg
+	                        else:
+					dashmsg[hostname+".queue"] = States.D_DOWN
+	                                self.Log.logger.info("Worker does not respond: %s" % hostname)
+				self.status.close()
+				del self.status; del self.poller
+			for hostname in reg_nodes:
+	 			self.status = self.context.socket(zmq.REQ)
+	                        self.status.setsockopt(zmq.LINGER,0)
+	                        self.status.connect("tcp://"+hostname+":5001")
+
+	                        self.status.send(States.D_GETSTATUS)
+	                        self.poller = zmq.Poller()
+	                        self.poller.register(self.status,zmq.POLLIN)
+	                        if self.poller.poll(3000):
+	                                msg = self.status.recv_json()
+	                                if msg: dashmsg[hostname+".status"] = msg
+	                        else:
+					dashmsg[hostname+".status"] = States.D_DOWN
+	                                self.Log.logger.info("Worker does not respond: %s" % hostname)
+				self.status.close()
+				del self.status; del self.poller
+			mongodb_stats = self.get_mongodb_stats(reg_nodes)
+			dashmsg["mongodb_stats"] = mongodb_stats
+			self.dashserver_pub.send_json(dashmsg)
+			#self.Log.logger.info(dashmsg)
+			del dashmsg; del active_nodes; del mastermsg; del mongodb_stats
+			time.sleep(0.5)
+
+class DistillerDashStatus(threading.Thread):
+        def __init__(self):
+                threading.Thread.__init__(self)
+        def run(self):
+                self.context = zmq.Context()
+                self.status = self.context.socket(zmq.REP)
+                self.status.bind(DASH_SERVER_STATUS_ENDPOINT)
+                self.poller = zmq.Poller()
+                self.poller.register(self.status,zmq.POLLIN)
+                self.Log = DistillerLogger(DASH_LOG_FILE,"DistillerDashboardStatus")
+                while True:
+                        if self.poller.poll(100):
+                                try:
+                                        msg = self.status.recv()
+                                        if msg == States.D_GETSTATUS:
+                                                self.status.send(States.D_OK)
+                                except Exception, e:
+                                        self.Log.logger.error("Error while trying to send ACK heartbeat: %s" % e)
+
+class DistillerDashNodeJSStatus(threading.Thread):
+        def __init__(self):
+		self.unix_socket = "/tmp/distiller_dash.nodejs.status" #FIXME: Hardcoded
+		self.Log = DistillerLogger(DASH_LOG_FILE,"DistillerDashboardNodeJSStatus")
+                threading.Thread.__init__(self)
+        def run(self):
+		try:
+			os.remove(self.unix_socket)
+		except OSError,e:
+			self.Log.logger.error(e)
+		self.s = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+		self.s.bind(self.unix_socket)
+		self.s.listen(1)			
+                while True:
+			try:
+				connection,address = self.s.accept()
+				data = connection.recv(1024)
+				if not data:
+					self.Log.logger.error("Could no receive data.")
+					connection.close()
+				if data == States.D_GETSTATUS:
+					connection.send(States.D_OK)
+				elif data != States.D_GETSTATUS:
+					connection.send(States.D_ERROR)
+			except Exception, e:
+				self.Log.logger.error("UNIX Socket Error: %s" % s)
+			finally:
+				connection.close()
+				del connection; del address
+
+
+class DistillerDashServer(object):
+	def __init__(self):
+	        self.stdin_path = '/dev/null'
+	        self.stdout_path = '/tmp/out.txt'
+	        self.stderr_path = '/tmp/err.txt'
+	        self.pidfile_path =  DASH_PID_FILE
+	        self.pidfile_timeout = 5
+	def run(self):
+		DashServer = DistillerDash()
+		DashServer.run()
+		
+
+if __name__ == "__main__":
+
+	optparser = optparse.OptionParser(usage=usage,version=version)
+	(options, args) = optparser.parse_args()
+
+	setproctitle.setproctitle(SERVICE_NAME)
+		
+	if len(args) == 0:
+	        optparser.print_help()
+	        sys.exit(-1)
+
+	if args[0] == 'start':
+		if not os.path.exists(DASH_PID_FILE):
+			server = DistillerDashServer()
+			#server.run()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._start()
+		else:
+			print "PID File exists: %s" % DASH_PID_FILE
+	elif args[0] == 'stop':
+		if os.path.exists(DASH_PID_FILE):
+			server = DistillerDashServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._stop()
+		else:
+			print "Dash server is not running."
+	elif args[0] == 'restart':
+		if os.path.exists(DASH_PID_FILE):
+			server = DistillerDashServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._restart()
+		else:
+			server = DistillerDashServer()
+			daemon_runner = runner.DaemonRunner(server)
+			daemon_runner._start()
+	elif args[0] == 'status':
+		if os.path.exists(DASH_PID_FILE):
+			fd = open(DASH_PID_FILE,'r')
+			pid = fd.readlines()[0].strip()
+			fd.close()
+			print "Dash server is running, PID: %s" % pid
+		else:
+			print "Dash server is not running"
+	elif args[0] == 'log':
+		setproctitle.setproctitle(sys.argv[0]+" "+args[0])
+                log = DistillerTailLog(DASH_LOG_FILE)
+		if len(args) == 2: log.tail(int(args[1])) 
+                log.follow()
+	elif args[0] == 'foreground':
+		setproctitle.setproctitle(sys.argv[0]+" "+args[0])
+		if not os.path.exists(DASH_PID_FILE):
+			DashServer = DistillerDash()
+			DashServer.run()
+		else:
+			print "PID File exists: %s. Server is running." % DASH_PID_FILE
+		
+	else:
+	        optparser.print_help()
+	        sys.exit(-1)
