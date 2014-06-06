@@ -1,0 +1,14 @@
+{
+	"name": "application-name"
+	, "version": "0.1.0"
+	, "private": true
+	, "dependencies": {
+		" express": "2.5.8"
+		, "stylus": ">= 0.0.1"
+		, "jade": ">= 0.0.1"
+		, "connect": ">= 0.0.1"
+		, "zmq": "> 2.0.0"
+		, "socket.io": "> 0.1.0"
+		, "LDAP": ">1.0.1"
+	}
+}

@@ -1,0 +1,16 @@
+h1 Login
+- if (flash.warn)
+  div.error#flash_msg= flash.warn
+  script(type='text/javascript')
+        flash_fadeOut("flash_msg")
+form(action='/sessions', method='POST', name='loginForm')
+  input(type='hidden', name='redirurl', value=redirurl)
+  p
+    label(for='login') Username:
+    input(type='text', name='login', id='login')
+  p
+    label(for='password')  Password: 
+    input(type='password', name='password', id='password')
+  p
+    input(type='submit',value='Login')
+

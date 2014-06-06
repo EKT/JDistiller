@@ -1,0 +1,37 @@
+doctype html
+html
+  head
+    title= title
+    link(rel='stylesheet', href='/stylesheets/style.css')
+    link(rel='stylesheet', href='/stylesheets/scrollbar.css')
+    link(rel='stylesheet', href='/stylesheets/chunkfive-fontface.css')
+    link(rel='stylesheet', href='/javascripts/tip/jquery.qtip.min.css')
+    script(src='/socket.io/socket.io.js')
+    script(src='/javascripts/smoothie.js')
+    script(src='/javascripts/jquery.min.js')
+    //script(src='/javascripts/alpha.js')
+    script(src='/javascripts/tip/jquery.qtip.min.js')
+  body
+    header
+      nav
+        ul
+          li
+            a(href="/") Home
+          li
+            a(href="/logserver") Logs
+          li
+            a(href="/nodeinfo") Cluster
+          li
+            a(href="/statistics") Statistics
+          - if (session.user)
+            li
+              a(href="sessions/destroy") Logout
+    section#wrapper!= body
+        footer
+          section.css-table
+                //span Logged in as #{user.login}. Total logged in users: #{totalusers}
+                span Logged in as #{user.login}.
+                br
+          section.css-table
+                p All contents of this site, unless otherwise noted, are &copy; <strong>National Documentation Centre</strong>.  All Rights Reserved. 
+

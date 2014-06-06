@@ -1,0 +1,214 @@
+h2 JDistiller Elastic Cluster - Statistics
+#totalpages
+#totalfiles
+#meantime_totalfiles
+#meantime_totalpages
+link(rel='stylesheet', href='/stylesheets/jquery.noty.css')
+link(rel='stylesheet', href='/stylesheets/noty_theme_default.css')
+link(rel='stylesheet', href='/stylesheets/noty_theme_growl.css')
+link(rel='stylesheet', href='/stylesheets/jquery-ui.css')
+script(src='/javascripts/jquery.min.js')
+script(src='/javascripts/jquery-ui.min.js')
+script(src='/javascripts/highcharts.js')
+script(src='/javascripts/exporting.js')
+script(src='/javascripts/statistics.js')
+script(src='/javascripts/jquery.noty.js')
+script(type='text/javascript').
+	var mongodb_totalpages = 0;
+	var mongodb_totalfiles = 0;
+	var mongodb_meantime_totalpages = 0;
+	var mongodb_meantime_totalfiles = 0;
+	var totalpages_chart_len = 0;
+	var totalfiles_chart_len = 0;
+	var totalfiles_chart = 0;
+	var totalpages_chart = 0;
+	var totalfiles_chart_ids = {};
+	var totalpages_chart_ids = {};
+	
+	var totalpages_meantime_chart_len = 0;
+	var totalfiles_meantime_chart_len = 0;
+	var totalfiles_meantime_chart = 0;
+	var totalpages_meantime_chart = 0;
+	var totalfiles_meantime_chart_ids = {};
+	var totalpages_meantime_chart_ids = {};
+	var totalfiles_meantime_chart_nodes = [];
+	var totalpages_meantime_chart_nodes = [];
+	function create_htmlpage()
+	{
+		var series_data = [];
+		for(var key in window.mongodb_totalpages)
+		{
+			series_data.push({"name":key, "data": window.mongodb_totalpages[key]});
+		}
+		window.totalpages_chart = create_monthly_stats('totalpages',"Monthly Total Converted Pages",series_data,'Pages');
+		var series_data = [];
+		for(var key in window.mongodb_totalfiles)
+		{
+			series_data.push({"name":key, "data": window.mongodb_totalfiles[key]});
+		}
+		window.totalfiles_chart = create_monthly_stats('totalfiles',"Monthly Total Converted Files",series_data,'Files');
+		var chart_len = window.totalpages_chart.series.length;
+		window.totalpages_chart_len = chart_len;
+		window.totalfiles_chart_len = window.totalfiles_chart.series.length;
+		for(var i=0; i < window.totalpages_chart_len; i++)
+		{
+			window.totalpages_chart_ids[i]= window.totalpages_chart.series[i].name;
+		}
+		for(var i=0; i < window.totalfiles_chart_len; i++)
+		{
+			window.totalfiles_chart_ids[i]= window.totalfiles_chart.series[i].name;
+		}
+		var pdf2png_data = {name: 'PDF to PNG',data: [],pointWidth: 12};
+		var png2jp2_data = {name: 'PNG to JP2',data: [],pointWidth: 12};
+		var tiff2jp2_data = {name: 'TIFF to JP2',data: [],pointWidth: 12};
+		var category_data = [];
+		for(var key in window.mongodb_meantime_totalfiles)
+		{
+			pdf2png_data.data.push(window.mongodb_meantime_totalfiles[key][0]);
+			png2jp2_data.data.push(window.mongodb_meantime_totalfiles[key][1]);
+			tiff2jp2_data.data.push(window.mongodb_meantime_totalfiles[key][2]);
+			category_data.push(key);
+			window.totalfiles_meantime_chart_nodes.push(key);
+		}
+		window.totalfiles_meantime_chart = create_meantime_stats("meantime_totalfiles","Average Conversion Time Per File",category_data,[pdf2png_data,png2jp2_data,tiff2jp2_data]);
+		var pdf2png_data = {name: 'PDF to PNG',data: [],pointWidth: 12};
+		var png2jp2_data = {name: 'PNG to JP2',data: [],pointWidth: 12};
+		var tiff2jp2_data = {name: 'TIFF to JP2',data: [],pointWidth: 12};
+		var category_data = [];
+		for(var key in window.mongodb_meantime_totalpages)
+		{
+			pdf2png_data.data.push(window.mongodb_meantime_totalpages[key][0]);
+			png2jp2_data.data.push(window.mongodb_meantime_totalpages[key][1]);
+			tiff2jp2_data.data.push(window.mongodb_meantime_totalpages[key][2]);
+			category_data.push(key);
+			window.totalpages_meantime_chart_nodes.push(key);
+		}
+		window.totalpages_meantime_chart = create_meantime_stats("meantime_totalpages","Average Conversion Time Per Page",category_data,[pdf2png_data,png2jp2_data,tiff2jp2_data]);
+		
+		window.totalfiles_meantime_chart_len = window.totalfiles_meantime_chart.series.length;
+		for(var i=0; i < window.totalfiles_meantime_chart_len; i++)
+		{
+			window.totalfiles_meantime_chart_ids[i]= window.totalfiles_meantime_chart.series[i].name;
+		}
+		
+		window.totalpages_meantime_chart_len = window.totalpages_meantime_chart.series.length;
+		for(var i=0; i < window.totalpages_meantime_chart_len; i++)
+		{
+			window.totalpages_meantime_chart_ids[i]= window.totalpages_meantime_chart.series[i].name;
+		}
+		if(window.noty_id != null)
+		{
+				$.noty.close(window.noty_id);
+				window.noty_id = null;
+		}
+		
+	}
+	var noty_id = null;
+	function check_msg_create_dom()
+	{
+		if(window.mongodb_totalpages!=0)
+		{
+			create_htmlpage();
+		}else{
+			setTimeout(function(){check_msg_create_dom();},100);
+		}
+	}
+
+	var socket = io.connect("https://dpool.ekt.gr:4433",{secure:true});
+	socket.on("disconnect",function() {
+		console.log("Disconnected...");
+	});
+	socket.on("dashboardStatus",function(data) {
+		if(data.toString() == "running")
+		{
+			if(window.noty_id != null)
+			{
+				$.noty.close(window.noty_id);
+				noty({"text":"Dashboard Server is up.","layout":"top","type":"success","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":500,"timeout":3000,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":false});
+				window.noty_id = null;
+			}
+		}
+		else if(data.toString() == "down")
+		{
+			if(window.noty_id == null)
+			{
+				window.noty_id = noty({"text":"Dashboard Server is down.","layout":"top","type":"error","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":500,"timeout":false,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":true});
+			}
+		}
+	});
+
+	socket.on('mongodbmessage', function(data){
+		if(window.mongodb_totalpages !=0)
+		{
+			for(var i=0; i<window.totalpages_chart_len; i++)
+			{
+				var dataArray = data.mongo_totalpages[window.totalpages_chart_ids[i]];
+				for(var j=0; j < dataArray.length; j++)
+				{
+					if(window.mongodb_totalpages[window.totalpages_chart_ids[i]][j] != dataArray[j])
+					{
+						window.mongodb_totalpages[window.totalpages_chart_ids[i]][j] = dataArray[j];
+						window.totalpages_chart.series[i].data[j].update(y=dataArray[j]);
+					}
+				}
+			}
+		}
+		if(window.mongodb_totalfiles !=0)
+		{
+			for(var i=0; i<window.totalfiles_chart_len; i++)
+			{
+				var dataArray = data.mongo_totalfiles[window.totalfiles_chart_ids[i]];
+				for(var j=0; j < dataArray.length; j++)
+				{
+					if(window.mongodb_totalfiles[window.totalfiles_chart_ids[i]][j] != dataArray[j])
+					{
+						window.mongodb_totalfiles[window.totalfiles_chart_ids[i]][j] = dataArray[j];
+						window.totalfiles_chart.series[i].data[j].update(y=dataArray[j]);
+					}
+				}
+			}
+		}
+		if(window.mongodb_meantime_totalfiles !=0)
+		{
+			for(var i=0; i<window.totalfiles_meantime_chart_len; i++)
+			{
+				var dataArray = data.mongo_meantime_totalfiles[window.totalfiles_meantime_chart_nodes[i]];//carbon [8,9,10]
+				for(var j=0; j < dataArray.length; j++)
+				{
+					if(window.mongodb_meantime_totalfiles[window.totalfiles_meantime_chart_nodes[i]][j] != dataArray[j])
+					{
+						window.mongodb_meantime_totalfiles[window.totalfiles_meantime_chart_nodes[i]][j] = dataArray[j];
+						
+						window.totalfiles_meantime_chart.series[j].data[i].update(y=dataArray[j]);
+					}
+				}
+			}
+		}
+		if(window.mongodb_meantime_totalpages !=0)
+		{
+			for(var i=0; i<window.totalpages_meantime_chart_len; i++)
+			{
+				var dataArray = data.mongo_meantime_totalpages[window.totalpages_meantime_chart_nodes[i]];
+				for(var j=0; j < dataArray.length; j++)
+				{
+					if(window.mongodb_meantime_totalpages[window.totalpages_meantime_chart_nodes[i]][j] != dataArray[j])
+					{
+						window.mongodb_meantime_totalpages[window.totalpages_meantime_chart_nodes[i]][j] = dataArray[j];
+						window.totalpages_meantime_chart.series[j].data[i].update(y=dataArray[j]);
+					}
+				}
+			}
+		}
+		if(window.mongodb_totalpages==0)
+		{
+			window.mongodb_totalpages = data.mongo_totalpages;
+			window.mongodb_totalfiles = data.mongo_totalfiles;
+			window.mongodb_meantime_totalpages = data.mongo_meantime_totalpages;
+			window.mongodb_meantime_totalfiles = data.mongo_meantime_totalfiles;
+		}
+	});
+
+	$(document).ready(function(){
+		if(window.noty_id == null){window.noty_id = noty({"text":"<img src='/images/loading.gif'><h6>Please wait...</h6>","layout":"center","type":"information","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":0,"timeout":false,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":true,"theme":"noty_theme_growl"});};
+		check_msg_create_dom();
+	});	

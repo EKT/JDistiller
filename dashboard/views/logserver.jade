@@ -1,0 +1,12 @@
+<h2>JDistiller Elastic Cluster - Log Messages</h2>
+<div id="logcontainer">
+<pre id="ulist" STYLE="font-family:monospace;font-size:1.40em;width:900px;height:600px;overflow-y:auto;overflow-x:hide;" class="log"></pre>
+</div>
+script(type='text/javascript').
+   var socket = io.connect("https://dmaster.extcloud0.ekt.gr:4433",{secure:true})
+   socket.on("disconnect",function() {
+                      document.getElementById("ulist").innerHTML = "Disconnected...";
+   })
+   socket.on('logmessage', function(data){
+           document.getElementById("ulist").innerHTML = data;
+   })  

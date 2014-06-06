@@ -1,0 +1,273 @@
+h2 JDistiller Elastic Cluster - Nodes Information
+<h4 id="expanderHead" style="cursor:pointer; width:200px;font-family: 'Copperplate / Copperplate Gothic Light', sans-serif;font-size: 13px"></h4>
+<div id="expanderContent" style="display:block"></div>
+<h4 id="expanderMasterHead" style="cursor:pointer; width:200px;font-family: 'Copperplate / Copperplate Gothic Light', sans-serif;font-size: 13px"> </h4>
+<div id="expanderMasterContent" style="display:block"></div>
+link(rel='stylesheet', href='/stylesheets/jquery-ui.css')
+link(rel='stylesheet', href='/stylesheets/jquery.noty.css')
+link(rel='stylesheet', href='/stylesheets/noty_theme_default.css')
+script(src='/javascripts/jquery.min.js')
+//script(src='http://jqueryui.com/jquery-1.7.2.js')
+script(src='/javascripts/jquery-ui.min.js')
+script(src='/javascripts/highcharts.js')
+script(src='/javascripts/jquery-multiaccordion.js')
+script(src='/javascripts/jquery.noty.js')
+script(src='/javascripts/jquery.blockUI.js')
+script(src='/javascripts/nodeinfo.js')
+script(type='text/javascript').
+   var jnodes = 0;
+   var jnodes_entities = 0;
+   var noty_id = null;
+   function check_nodes_create_dom(){
+        if(window.jnodes !=0){
+           create_htmlpage();
+        }else{
+           setTimeout(function(){check_nodes_create_dom();},100);
+           //setTimeout(function(){$("#expanderHead").html("Waiting server data...");$("#expanderMasterHead").html("Waiting server data...");check_nodes_create_dom();},100);
+           //setTimeout(function(){if(window.noty_id == null){window.noty_id = noty({"text":"Please wait...","layout":"center","type":"information","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":0,"timeout":false,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":true});};check_nodes_create_dom();},100);
+        }
+   }
+    var socket = io.connect("https://dpool.ekt.gr:4433",{secure:true});
+    socket.on("disconnect",function() {
+           console.log("Disconnected...");
+    });
+    socket.on("dashboardStatus",function(data) {
+           if(data.toString() == "running")
+           {
+                if(window.noty_id != null)
+                {
+                    $.noty.close(window.noty_id);
+                    noty({"text":"Dashboard Server is up.","layout":"top","type":"success","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":500,"timeout":3000,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":false});
+                    window.noty_id = null;
+                }
+           }
+           else if(data.toString() == "down")
+           {
+               if(window.noty_id == null)
+               {
+                       window.noty_id = noty({"text":"Dashboard Server is down.","layout":"top","type":"error","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":500,"timeout":false,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":true});
+               }
+           }
+    });
+    socket.on('nodesmessage', function(data){
+           window.jnodes_entities = data;
+           if(window.jnodes != 0)
+           {
+                 for(var i=0; i < jnodes.length; i++)
+                 {
+                      var status_html = '<b style="color: #3E576F;font-size:12px">Status</b><br>';
+                      if(window.jnodes_entities["status"][jnodes[i]] == 'NO_BUSY')
+                      {
+                           status_html += '<pre style="color: green;font-size:10px">IDLE</pre>';
+                      }else if(window.jnodes_entities["status"][jnodes[i]] == 'BUSY')
+                      {
+                           status_html += '<pre style="color: cyan;font-size:10px">PROCESSING</pre>';
+                      }else if(window.jnodes_entities["status"][jnodes[i]] == 'DOWN')
+                      {
+                           status_html += '<pre style="color: red;font-size:10px">DOWN</pre>';
+                      }
+                      status_html += '<b style="color: #3E576F;font-size:12px"> Node Information </b><pre style="font-size:10px">Worker: '+window.jnodes_entities[jnodes[i]+'.status']['WORKER'];
+                      status_html += '<br>Queue: '+window.jnodes_entities[jnodes[i]+'.status']['QUEUE']+'<br>Converter: '+window.jnodes_entities[jnodes[i]+'.status']['CONVERTER']+'<br>PdfConverter: '+window.jnodes_entities[jnodes[i]+'.status']['PDFCONVERTER']+'</pre>';
+                      if(window.jnodes_entities[jnodes[i]+'.queue'] === undefined)
+                      {
+                                 status_html += '<b style="color: #3E576F;font-size:12px"> Queues Size </b><pre style="font-size:10px">PDF: N/A';
+                      }else{
+                                 status_html += '<b style="color: #3E576F;font-size:12px"> Queues Size </b><pre style="font-size:10px">PDF: '+window.jnodes_entities[jnodes[i]+'.queue']['PNGQUEUE'];
+                      }
+                      if(typeof(window.jnodes_entities[jnodes[i]+'.queue']) == 'undefined')
+                      {
+                                 status_html += '<br>JP2: N/A</pre>';
+                      }else{
+                                 status_html += '<br>JP2: '+window.jnodes_entities[jnodes[i]+'.queue']['JP2QUEUE']+'</pre>';
+                      }
+                      
+                      document.getElementById(jnodes[i]+'.status').innerHTML = status_html;
+                      
+                      if(window.jnodes_entities["status"][jnodes[i]] != 'DOWN')
+                      {
+                         for(var j=0; j < window.jnodes_entities[jnodes[i]]["NUM_CPUS"]; j++)
+                         {
+                             window[get_attr(jnodes[i],'load')].series[j].data[0].update(window.jnodes_entities[jnodes[i]]["CPU_PERCENT"][j]);
+                         }
+                         if(window.jnodes_entities[jnodes[i]]["PHYMEM_USAGE"] != undefined)
+                         {
+                                  window[get_attr(jnodes[i],'phymem')].series[0].data[0].update(y = window.jnodes_entities[jnodes[i]]["PHYMEM_USAGE"][2]);
+                                  window[get_attr(jnodes[i],'phymem')].series[0].data[1].update(y = window.jnodes_entities[jnodes[i]]["PHYMEM_USAGE"][1]);
+                                  window[get_attr(jnodes[i],'virmem')].series[0].data[0].update(y = window.jnodes_entities[jnodes[i]]["VIRTMEM_USAGE"][2]);
+                                  window[get_attr(jnodes[i],'virmem')].series[0].data[1].update(y = window.jnodes_entities[jnodes[i]]["VIRTMEM_USAGE"][1]);
+                                  window[get_attr(jnodes[i],'disk_usage')].series[0].data[0].update(y = window.jnodes_entities[jnodes[i]]["DISK_USAGE"][2]);
+                                  window[get_attr(jnodes[i],'disk_usage')].series[0].data[1].update(y = window.jnodes_entities[jnodes[i]]["DISK_USAGE"][1]);
+                         }
+                         var counter_html = '<b style="color: #3E576F;font-size:12px"> Disk I/O Counters </b><br>Read bytes: '+bytesToSize(window.jnodes_entities[jnodes[i]]["DISK_IO_COUNTERS"][2],2);
+                         counter_html += '<br>Write bytes: '+bytesToSize(window.jnodes_entities[jnodes[i]]["DISK_IO_COUNTERS"][3],2)+'<br><b style="color: #3E576F;font-size:12px"> Network I/O Counters </b><br>';
+                         for(var key in window.jnodes_entities[jnodes[i]]["NETWORK_IO_COUNTERS"])
+                         {
+                               counter_html += '<b>'+key.split(':')[0]+'</b><br>';
+                               counter_html += 'TX bytes: '+bytesToSize(window.jnodes_entities[jnodes[i]]["NETWORK_IO_COUNTERS"][key][0])+'<br>';
+                               counter_html += 'RX bytes: '+bytesToSize(window.jnodes_entities[jnodes[i]]["NETWORK_IO_COUNTERS"][key][1])+'<br>';
+                         }
+                         document.getElementById(jnodes[i]+'.disk_net_io').innerHTML = counter_html;
+                         var master_svc_html = '';
+                         for(var skey in window.jnodes_entities["master_services"])
+                         {
+                               if(skey.indexOf(".services") > 0)
+                               {
+                                        master_svc_html += '<b style="color: #3E576F;font-size:12px">'+skey.split('\.services')[0]+'</b>';
+                                        var status_class = "running";
+                                        master_svc_html += '<TABLE border="0" cellpadding="0" cellspacing="0" width="200"><tbody style="font-size:11px;font-family: ‘Lucida Console’, Monaco, monospace;">';
+                                        for(var k=0;k< window.jnodes_entities["master_services"][skey].length; k++)
+                                        {
+                                             var server = window.jnodes_entities["master_services"][skey][k];
+                                             var status = window.jnodes_entities["master_services"][skey.split('\.services')[0]+'.'+server.split(' ')[0]];
+                                             if(status.toLowerCase() == "running")
+                                             {
+                                                    master_svc_html += '<tr><td>'+server+'</td><td>'+status+'</td>';
+                                             }
+                                             else if(status.toLowerCase() == "down")
+                                             {
+                                                    status_class = "down";
+                                                    master_svc_html += '<tr><td>'+server+'</td><td>'+status+'</td>';
+                                             }
+                                             
+                                        }
+                               }
+                         }
+                         master_svc_html += '</tbody></table>';
+                         if(status_class == "running")
+                         {
+                               $('#expanderMasterContent').attr('class','master_up');
+                         }
+                         else if(status_class == "down")
+                         {
+                               $('#expanderMasterContent').attr('class','master_down');
+                         }
+                         document.getElementById('expanderMasterContent').innerHTML = master_svc_html;
+                      }
+                 }
+           }
+           if(window.jnodes == 0) {
+                      window.jnodes = data["activenodes"];
+                      console.log(window.jnodes);
+           }
+           
+   });
+   
+   $(document).ready(function(){
+             if(window.noty_id == null){window.noty_id = noty({"text":"<img src='/images/loading.gif'><h6>Please wait...</h6>","layout":"center","type":"information","animateOpen":{"height":"toggle"},"animateClose":{"height":"toggle"},"speed":0,"timeout":false,"closeButton":false,"closeOnSelfClick":false,"closeOnSelfOver":false,"modal":true,"theme":"noty_theme_growl"});};
+             check_nodes_create_dom(); 
+   });
+
+   
+   function create_htmlpage() {
+    $("#expanderHead").html('<span id="expanderSign">+</span> Active Worker Nodes');
+    $("#expanderMasterHead").html('<span id="expanderMasterSign">+</span> Master Node');
+    var html_code = create_nodes(jnodes);
+    document.getElementById("expanderContent").innerHTML = html_code;
+    var master_svc_html = '';
+    for(var key in window.jnodes_entities["master_services"])
+    {
+        if(key.indexOf(".services") > 0)
+        {
+             master_svc_html += '<b style="color: #3E576F;font-size:12px">'+key.split('\.services')[0]+'</b>';
+             master_svc_html += '<TABLE border="0" cellpadding="0" cellspacing="0" width="200"><tbody style="font-size:11px;font-family: ‘Lucida Console’, Monaco, monospace;">';
+            var status_class = "running";
+            for(var i=0;i< window.jnodes_entities["master_services"][key].length; i++)
+            {
+                    var server = window.jnodes_entities["master_services"][key][i];
+                    var status = window.jnodes_entities["master_services"][key.split('\.services')[0]+'.'+server.split(' ')[0]];
+                    if(status.toLowerCase() == "running")
+                    {
+                         master_svc_html += '<tr><td>'+server+'</td><td>'+status+'</td>';
+                    }
+                    else if(status.toLowerCase() == "down")
+                    {
+                         master_svc_html += '<tr><td>'+server+'</td><td>'+status+'</td>';
+                         status_class = "down";
+                    }
+            }
+        }
+    }
+    master_svc_html += '</tbody></table>';
+    if(status_class == "running")
+    {
+         $('#expanderMasterContent').attr('class','master_up');
+    }
+    else if(status_class == "down")
+    {
+         $('#expanderMasterContent').attr('class','master_down');
+    }
+    document.getElementById('expanderMasterContent').innerHTML = master_svc_html;
+    for(var i=0; i < jnodes.length; i++)
+    {
+           create_template(jnodes[i]);
+           window[get_attr(jnodes[i],'phymem')] = create_pie(jnodes[i]+'.phymem',"Physical Memory");
+           window[get_attr(jnodes[i],'virmem')] = create_pie(jnodes[i]+'.virmem',"Virtual Memory");
+           window[get_attr(jnodes[i],'disk_usage')] = create_pie(jnodes[i]+'.disk_usage',"Disk Usage");
+           if(window.jnodes_entities["status"][jnodes[i]] != 'DOWN')
+           {
+              var cpu_data = [];
+              for(var j=0; j < window.jnodes_entities[jnodes[i]]["NUM_CPUS"]; j++)
+              {
+                   cpu_data.push({name: 'CPU #'+j, data: [window.jnodes_entities[jnodes[i]]["CPU_PERCENT"][j]]});
+              }
+              var cpu_no = [];
+              if(window.jnodes_entities[jnodes[i]]["NUM_CPUS"] < 2)
+              {
+                     cpu_no.push(['CPU ('+window.jnodes_entities[jnodes[i]]["NUM_CPUS"]+' Core)']);
+                     window[get_attr(jnodes[i],'load')] = create_bar(jnodes[i]+'.load',"CPU Load",cpu_no,cpu_data);
+              }else
+              {
+                     cpu_no.push(['CPU ('+window.jnodes_entities[jnodes[i]]["NUM_CPUS"]+' Cores)']);
+                     window[get_attr(jnodes[i],'load')] = create_bar(jnodes[i]+'.load',"CPU Load",cpu_no,cpu_data);
+              }
+              if(window.jnodes_entities[jnodes[i]]["PHYMEM_USAGE"] != undefined)
+              {
+                    window[get_attr(jnodes[i],'phymem')].series[0].data[0].update(y = window.jnodes_entities[jnodes[i]]["PHYMEM_USAGE"][2]);
+                    window[get_attr(jnodes[i],'phymem')].series[0].data[1].update(y = window.jnodes_entities[jnodes[i]]["PHYMEM_USAGE"][1]);
+                    window[get_attr(jnodes[i],'virmem')].series[0].data[0].update(y = window.jnodes_entities[jnodes[i]]["VIRTMEM_USAGE"][2]);
+                    window[get_attr(jnodes[i],'virmem')].series[0].data[1].update(y = window.jnodes_entities[jnodes[i]]["VIRTMEM_USAGE"][1]);
+                    window[get_attr(jnodes[i],'disk_usage')].series[0].data[0].update(y = window.jnodes_entities[jnodes[i]]["DISK_USAGE"][2]);
+                    window[get_attr(jnodes[i],'disk_usage')].series[0].data[1].update(y = window.jnodes_entities[jnodes[i]]["DISK_USAGE"][1]);
+              }
+           }
+    }
+    
+    var icons = {
+                        header: "ui-icon-plus",
+                        headerSelected: "ui-icon-minus"
+                        //header: "ui-icon-circle-arrow-e",
+                        //headerSelected: "ui-icon-circle-arrow-s"
+    };
+    //$("#accordion").accordion({active: false,collapsible: true,icons:icons})
+    $("#accordion").multiAccordion({active: 'none' });
+    
+    $("#expanderContent").hide();
+    $("#expanderHead").click(function(){
+                         $("#expanderContent").slideToggle(350);
+                         if ($("#expanderSign").text() == "+") {
+                                $("#expanderSign").html("-")
+                                $("#expanderSign").css("color","#f00")
+                         }
+                         else {
+                                $("#expanderSign").html("+")
+                                $("#expanderSign").css("color","#000")
+                         }
+     });
+    $("#expanderMasterContent").hide();
+    $("#expanderMasterHead").click(function(){
+                         $("#expanderMasterContent").slideToggle(350);
+                         if ($("#expanderMasterSign").text() == "+") {
+                                $("#expanderMasterSign").html("-")
+                                $("#expanderMasterSign").css("color","#f00")
+                         }
+                         else {
+                                $("#expanderMasterSign").html("+")
+                                $("#expanderMasterSign").css("color","#000")
+                         }
+     });
+     if(window.noty_id != null)
+     {
+                 $.noty.close(window.noty_id);
+                 window.noty_id = null;
+     }
+    }//create_htmlpage function
