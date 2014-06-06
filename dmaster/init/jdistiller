@@ -57,6 +57,13 @@ start() {
         [ $RETVAL -eq 0 ] && touch $lockfile
         sleep 2
 
+	echo -n "Starting distiller-dashboard: "
+        daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-dashboard start"
+        RETVAL=$?
+        echo
+        [ $RETVAL -eq 0 ] && touch $lockfile
+        sleep 1
+
 	echo -n $"Starting distiller-exporter: "
 	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-exporter start"
 	RETVAL=$?
@@ -102,11 +109,15 @@ stop() {
 	RETVAL=$?
         echo
 
+        echo -n $"Shutting down distiller-dashboard: "
+        daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-dashboard stop"
+        RETVAL=$?
+        echo
+
         echo -n $"Shutting down distiller-master: "
 	daemon --user $DUSER "cd $DHOME; $DPYTHON $DHOME/distiller-master stop"
 	RETVAL=$?
         echo
-
 
 	echo -n "Cleaning up zombie distiller procs..."
 	for i in `ps -ef | grep distiller | grep -v grep | awk '{print $2}'`; 
@@ -125,6 +136,7 @@ status () {
 
 	echo -e "Status of distiller procs.."
 	cd $DHOME; $DPYTHON $DHOME/distiller-master status
+	cd $DHOME; $DPYTHON $DHOME/distiller-dispatcher status
 	cd $DHOME; $DPYTHON $DHOME/distiller-dispatcher status
 	cd $DHOME; $DPYTHON $DHOME/distiller-exporter status
 	cd $DHOME; $DPYTHON $DHOME/distiller-log status
