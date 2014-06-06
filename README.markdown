@@ -55,6 +55,14 @@ Note: for the first mount:
 your installation.
 * Start Master services with /etc/init.d/jdistiller start
 
+### DASHBOARD ###
+Install the jdistiller web dashboard on jdistiller Master server:
+* install node.js
+* ``yum install libuuid-devel libzmq3 zeromq   etc.`` for centos
+* install dependencies: ``cd /home/jdistiller/dashboard;npm install``
+* create ssl certifiate and place it in dashboard/certs.
+* deploy the node.js app
+
 ### SLAVE ###
 * Create a user named jdistiller with uid 1000 (useradd -u 1000). 
 * Clone dslave folder to a slave node (physical/virtual server) in jdistiller
